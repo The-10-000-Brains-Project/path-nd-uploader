@@ -13,12 +13,16 @@ def read_sidecar(path: Path) -> dict:
         return json.load(f)
 
 
-def read_manifest(path: Path) -> list[dict]:
-    """Reads a batch manifest: CSV or JSON-Lines, one row/line per slide.
+def read_manifest(path: Path, *, sheet: str | int | None = None) -> list[dict]:
+    """Reads a batch manifest: CSV, JSON-Lines, or Excel, one row/line per slide.
 
     Each record must include enough to locate the slide file itself — by
     convention the schema's `slide_paths` field, interpreted relative to the
     manifest's own directory unless it is absolute.
+
+    `sheet` selects a worksheet for `.xlsx` files by name or 0-based index
+    (default: the first sheet) — real institutional exports commonly ship
+    multiple sheets (e.g. slide-level vs. case-level data) in one workbook.
     """
     path = Path(path)
     if path.suffix.lower() in (".jsonl", ".ndjson"):
@@ -33,7 +37,29 @@ def read_manifest(path: Path) -> list[dict]:
     if path.suffix.lower() == ".csv":
         with path.open(newline="", encoding="utf-8") as f:
             return list(csv.DictReader(f))
-    raise ValueError(f"Unsupported manifest format: {path.suffix} (use .csv, .json, or .jsonl)")
+    if path.suffix.lower() == ".xlsx":
+        return _read_xlsx(path, sheet=sheet)
+    raise ValueError(f"Unsupported manifest format: {path.suffix} (use .csv, .json, .jsonl, or .xlsx)")
+
+
+def _read_xlsx(path: Path, *, sheet: str | int | None) -> list[dict]:
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    if sheet is None:
+        worksheet = workbook[workbook.sheetnames[0]]
+    elif isinstance(sheet, int):
+        worksheet = workbook[workbook.sheetnames[sheet]]
+    else:
+        worksheet = workbook[sheet]
+
+    rows = worksheet.iter_rows(values_only=True)
+    header = [str(h) if h is not None else "" for h in next(rows)]
+    return [
+        {col: value for col, value in zip(header, row) if col}
+        for row in rows
+        if any(v is not None for v in row)
+    ]
 
 
 def resolve_slide_path(record: dict, *, manifest_dir: Path) -> Path:

@@ -21,6 +21,7 @@ from .reconcile import ReconciliationResult, check_slide_path_exists, reconcile
 from .schema import Schema, load_schema
 from .slide import validate_slide
 from .slide.formats import SUPPORTED_EXTENSIONS
+from .slide.validator import DEFAULT_STABILITY_WAIT_SECONDS
 
 DEFAULT_WORKERS = 6
 
@@ -29,7 +30,7 @@ DEFAULT_WORKERS = 6
 class BatchItem:
     """One unit of work: a slide plus however its metadata was sourced."""
 
-    slide_path: Path
+    slide_path: Path | None  # None when the manifest row has no resolvable slide_paths at all
     metadata_path: Path | None = None  # set when metadata came from a standalone sidecar file
     record: dict | None = None  # set directly when metadata came from a manifest row
     known_gaps: frozenset[str] = frozenset()  # from the source profile, if any — see SourceProfile.known_gaps
@@ -65,9 +66,19 @@ def process_batch_item(
     bucket: storage.Bucket | None = None,
     deep: bool = True,
     strict: bool = False,
+    stability_wait_seconds: float = DEFAULT_STABILITY_WAIT_SECONDS,
 ) -> ItemResult:
-    slide_path = Path(item.slide_path)
     schema = schema or load_schema()
+
+    if item.slide_path is None:
+        declared = (item.record or {}).get("slide_paths")
+        return ItemResult(
+            slide_path=f"<unresolved: slide_paths={declared!r}>",
+            metadata_path=str(item.metadata_path) if item.metadata_path else None,
+            error="no resolvable slide_paths in this record — nothing to validate or upload",
+        )
+
+    slide_path = Path(item.slide_path)
     result = ItemResult(
         slide_path=str(slide_path),
         metadata_path=str(item.metadata_path) if item.metadata_path else None,
@@ -81,7 +92,7 @@ def process_batch_item(
                 record, schema=schema, strict=strict, downgrade_to_warning=item.known_gaps
             )
 
-        result.integrity_report = validate_slide(slide_path, deep=deep)
+        result.integrity_report = validate_slide(slide_path, deep=deep, stability_wait_seconds=stability_wait_seconds)
 
         if has_metadata and record.get("slide_paths"):
             path_error = check_slide_path_exists(record, slide_path)
@@ -109,6 +120,7 @@ def process_item(
     bucket: storage.Bucket | None = None,
     deep: bool = True,
     strict: bool = False,
+    stability_wait_seconds: float = DEFAULT_STABILITY_WAIT_SECONDS,
 ) -> ItemResult:
     """Single-item convenience wrapper around `process_batch_item`."""
     return process_batch_item(
@@ -117,6 +129,7 @@ def process_item(
         bucket=bucket,
         deep=deep,
         strict=strict,
+        stability_wait_seconds=stability_wait_seconds,
     )
 
 
@@ -144,14 +157,15 @@ def items_from_manifest(
     known_gaps = profile.known_gaps if profile is not None else frozenset()
     if profile is not None:
         records = [apply_profile(r, profile) for r in records]
-    return [
-        BatchItem(
-            slide_path=resolve_slide_path(record, manifest_dir=manifest_dir),
-            record=record,
-            known_gaps=known_gaps,
-        )
-        for record in records
-    ]
+
+    items = []
+    for record in records:
+        try:
+            slide_path = resolve_slide_path(record, manifest_dir=manifest_dir)
+        except KeyError:
+            slide_path = None  # surfaced as a per-item failure in process_batch_item, not a crash here
+        items.append(BatchItem(slide_path=slide_path, record=record, known_gaps=known_gaps))
+    return items
 
 
 def run_batch(
@@ -161,12 +175,21 @@ def run_batch(
     deep: bool = True,
     strict: bool = False,
     workers: int = DEFAULT_WORKERS,
+    stability_wait_seconds: float = DEFAULT_STABILITY_WAIT_SECONDS,
 ) -> list[ItemResult]:
     schema = load_schema()  # load once up front; process_batch_item's default would reparse the cache key each call
     results: list[ItemResult] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(process_batch_item, item, schema=schema, bucket=bucket, deep=deep, strict=strict)
+            executor.submit(
+                process_batch_item,
+                item,
+                schema=schema,
+                bucket=bucket,
+                deep=deep,
+                strict=strict,
+                stability_wait_seconds=stability_wait_seconds,
+            )
             for item in items
         ]
         for future in as_completed(futures):

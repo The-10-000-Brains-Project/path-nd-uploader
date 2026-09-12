@@ -43,15 +43,21 @@ pip install .
 terminal window — you'll know it worked because your prompt starts with
 `(.venv)`.
 
-Then sign in to Google Cloud, so the tool is allowed to read/write the bucket:
+Then sign in to Google Cloud — **two separate logins**, both needed (this
+tool uses the `gcloud` CLI directly for the actual file transfer, since it
+handles large/unreliable uploads far more robustly than reimplementing that
+ourselves, and separately uses a Python library for everything else, which
+keeps its own credentials):
 
 ```bash
+gcloud auth login
 gcloud auth application-default login
 ```
 
-This opens a browser window to log in. You only need to do this once per
+Each opens a browser window to log in. You only need to do this once per
 computer (it may expire after a while — if commands below start failing
-with an authentication error, just run this again).
+with an authentication error, just run whichever of the two lines above
+matches the error).
 
 That's it — test it worked with:
 
@@ -160,6 +166,18 @@ path-nd-uploader batch BDR_Slides_metadata.csv --bucket my-bucket-name --profile
 
 Run `path-nd-uploader batch --help` to see which profiles are available.
 
+### Moving slides between buckets
+
+Not the primary workflow (most uploads come from a local file via
+`upload`/`batch`), but if you need to copy already-uploaded slides from one
+bucket to another and have access to both, this copies server-side —
+data moves directly between the buckets, never through your machine — and
+validates each object first, skipping anything already corrupted:
+
+```bash
+path-nd-uploader transfer source-bucket-name dest-bucket-name --prefix Collection_PART/
+```
+
 ## If you see `[NEEDS REVIEW]`
 
 This means something couldn't be automatically resolved and needs a human
@@ -174,7 +192,8 @@ batch.
 | You see | What it means |
 |---|---|
 | `command not found: path-nd-uploader` | The virtual environment isn't activated — run `source .venv/bin/activate` (from inside the project folder) again. |
-| An authentication / permission error mentioning Google Cloud | Run `gcloud auth application-default login` again, and confirm you actually have access to the bucket you're targeting. |
+| `gcloud storage cp failed ... Reauthentication is needed` | Run `gcloud auth login` again. |
+| An authentication/permission error NOT mentioning `gcloud storage cp` | Run `gcloud auth application-default login` again, and confirm you actually have access to the bucket you're targeting. |
 | `[error] zero_tail: ...` | The slide file itself is corrupted/truncated — usually from an interrupted upload or copy. Re-copy or re-scan the original slide; don't retry the same file. |
 | `[error] reconcile.slide_paths: ...` | The metadata's `slide_paths` doesn't match the file you're actually uploading, or points at a file that doesn't exist. |
 | `[NEEDS REVIEW] ...` | See [above](#if-you-see-needs-review) — doesn't block upload, but needs a human decision. |

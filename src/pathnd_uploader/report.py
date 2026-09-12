@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .batch import ItemResult
+from .gcs.transfer import TransferResult
 from .integrity import IntegrityReport
 
 
@@ -65,5 +66,23 @@ def write_audit_report(reports: list[IntegrityReport], path: Path) -> None:
         "passed": sum(1 for r in reports if r.passed),
         "failed": sum(1 for r in reports if not r.passed),
         "items": [_integrity_report_to_dict(r) for r in reports],
+    }
+    Path(path).write_text(json.dumps(payload, indent=2, default=str))
+
+
+def write_transfer_report(results: list[TransferResult], path: Path) -> None:
+    payload = {
+        "total": len(results),
+        "copied": sum(1 for r in results if r.copied),
+        "skipped": sum(1 for r in results if not r.copied),
+        "items": [
+            {
+                "source_uri": r.source_uri,
+                "dest_uri": r.dest_uri,
+                "copied": r.copied,
+                "integrity": _integrity_report_to_dict(r.integrity_report),
+            }
+            for r in results
+        ],
     }
     Path(path).write_text(json.dumps(payload, indent=2, default=str))
