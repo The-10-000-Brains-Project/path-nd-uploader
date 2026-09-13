@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import google.api_core.exceptions as gax_exceptions
 import pytest
+import requests.exceptions as req_exc
 
 from pathnd_uploader.retry import is_transient, retry_transient
 
@@ -18,6 +19,17 @@ def test_is_transient_recognizes_known_transient_types():
     assert is_transient(gax_exceptions.TooManyRequests("x"))
     assert is_transient(ConnectionError("x"))
     assert is_transient(TimeoutError("x"))
+
+
+def test_is_transient_recognizes_requests_http_layer_errors():
+    # The exact case that misclassified 40 objects in a real cross-region
+    # transfer: google-cloud-storage's HTTP layer raises requests.ReadTimeout,
+    # which subclasses neither google.api_core exceptions nor TimeoutError.
+    assert is_transient(req_exc.ReadTimeout("Read timed out. (read timeout=60)"))
+    assert is_transient(req_exc.ConnectTimeout("x"))
+    assert is_transient(req_exc.Timeout("x"))
+    assert is_transient(req_exc.ConnectionError("x"))
+    assert is_transient(req_exc.ChunkedEncodingError("x"))
 
 
 def test_is_transient_rejects_unrelated_exceptions():
