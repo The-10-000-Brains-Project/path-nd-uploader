@@ -118,6 +118,26 @@ def test_transfer_object_skips_when_already_present_with_matching_crc32c():
     dest_bucket.blob.assert_not_called()  # no rewrite
 
 
+def test_transfer_object_no_validate_skips_source_read_but_still_copies():
+    # --no-validate: don't re-read the source to integrity-check it (redundant
+    # after an audit, and a big cross-region egress tax), but still copy.
+    source = _source_blob()
+    dest_bucket = MagicMock()
+    dest_bucket.name = "dest-bucket"
+    dest_bucket.get_blob.return_value = None
+    dest_blob = MagicMock()
+    dest_blob.metadata = {}
+    dest_bucket.blob.return_value = dest_blob
+    dest_blob.rewrite.return_value = (None, 1, 1)
+
+    with patch("pathnd_uploader.gcs.transfer._audit_object_with_retry") as mock_audit:
+        result = transfer_object(source, dest_bucket, validate=False)
+
+    assert result.copied
+    mock_audit.assert_not_called()  # source not re-read for validation
+    dest_blob.rewrite.assert_called()  # but the copy still happens
+
+
 def test_transfer_object_copies_when_dest_exists_but_crc32c_differs():
     # A partial/corrupt earlier copy (different checksum) must NOT be treated
     # as already-present — it gets re-copied.
