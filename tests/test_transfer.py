@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import google.api_core.exceptions as gax_exceptions
+
 from pathnd_uploader.gcs.transfer import _remap_key, transfer_bucket, transfer_object
 from pathnd_uploader.integrity import IntegrityIssue, IntegrityReport
 
@@ -29,7 +31,7 @@ def test_transfer_object_skips_copy_when_validation_fails():
     dest_bucket = MagicMock()
     dest_bucket.name = "dest-bucket"
 
-    with patch("pathnd_uploader.gcs.transfer.audit_object", return_value=_failing_report()):
+    with patch("pathnd_uploader.gcs.transfer._audit_object_with_retry", return_value=_failing_report()):
         result = transfer_object(source, dest_bucket)
 
     assert not result.copied
@@ -46,7 +48,7 @@ def test_transfer_object_copies_via_rewrite_loop_when_validation_passes():
     # First call returns a continuation token (large object, not done in one call); second completes it.
     dest_blob.rewrite.side_effect = [("tok1", 100, 1000), (None, 1000, 1000)]
 
-    with patch("pathnd_uploader.gcs.transfer.audit_object", return_value=_passing_report()):
+    with patch("pathnd_uploader.gcs.transfer._audit_object_with_retry", return_value=_passing_report()):
         result = transfer_object(source, dest_bucket)
 
     assert result.copied
@@ -66,7 +68,7 @@ def test_transfer_object_stamps_provenance_metadata():
     dest_bucket.blob.return_value = dest_blob
     dest_blob.rewrite.return_value = (None, 1000, 1000)
 
-    with patch("pathnd_uploader.gcs.transfer.audit_object", return_value=_passing_report()):
+    with patch("pathnd_uploader.gcs.transfer._audit_object_with_retry", return_value=_passing_report()):
         transfer_object(source, dest_bucket)
 
     assert dest_blob.metadata["existing"] == "value"  # preserved, not clobbered
@@ -84,7 +86,7 @@ def test_transfer_object_uses_explicit_dest_key():
     dest_bucket.blob.return_value = dest_blob
     dest_blob.rewrite.return_value = (None, 1000, 1000)
 
-    with patch("pathnd_uploader.gcs.transfer.audit_object", return_value=_passing_report()):
+    with patch("pathnd_uploader.gcs.transfer._audit_object_with_retry", return_value=_passing_report()):
         result = transfer_object(source, dest_bucket, dest_key="new/path/slide.svs")
 
     dest_bucket.blob.assert_called_once_with("new/path/slide.svs")
@@ -123,7 +125,7 @@ def test_transfer_bucket_iterates_source_blobs_and_remaps_dest_keys():
 
     with (
         patch("pathnd_uploader.gcs.transfer._iter_slide_blobs", return_value=[blob1, blob2]),
-        patch("pathnd_uploader.gcs.transfer.audit_object", return_value=_passing_report()),
+        patch("pathnd_uploader.gcs.transfer._audit_object_with_retry", return_value=_passing_report()),
     ):
         summary = transfer_bucket("src", "dst", prefix="Collection_X", dest_prefix="Collection_Y", client=client)
 
@@ -154,10 +156,37 @@ def test_transfer_bucket_skips_failing_objects_but_continues():
 
     with (
         patch("pathnd_uploader.gcs.transfer._iter_slide_blobs", return_value=[blob_bad, blob_good]),
-        patch("pathnd_uploader.gcs.transfer.audit_object", side_effect=fake_audit),
+        patch("pathnd_uploader.gcs.transfer._audit_object_with_retry", side_effect=fake_audit),
     ):
         summary = transfer_bucket("src", "dst", client=client)
 
     assert len(summary.copied) == 1
     assert len(summary.skipped) == 1
     assert summary.skipped[0].source_uri.endswith("bad.svs")
+
+
+def test_transfer_bucket_classifies_persistent_network_errors_as_inconclusive():
+    flaky_blob = _source_blob(name="Collection_X/flaky.svs")
+
+    client = MagicMock()
+    source_bucket = MagicMock()
+    dest_bucket = MagicMock()
+    dest_bucket.name = "dest-bucket"
+    client.bucket.side_effect = lambda name: source_bucket if name == "src" else dest_bucket
+
+    with (
+        patch("pathnd_uploader.gcs.transfer._iter_slide_blobs", return_value=[flaky_blob]),
+        patch(
+            "pathnd_uploader.gcs.transfer._audit_object_with_retry",
+            side_effect=gax_exceptions.ServiceUnavailable("network is down"),
+        ),
+        patch("time.sleep"),
+    ):
+        summary = transfer_bucket("src", "dst", client=client)
+
+    assert len(summary.copied) == 0
+    assert len(summary.skipped) == 0  # not a real failure either
+    assert len(summary.inconclusive) == 1
+    result = summary.inconclusive[0]
+    assert not result.copied
+    assert any(i.check == "transfer_incomplete" and i.severity == "inconclusive" for i in result.integrity_report.issues)

@@ -18,20 +18,32 @@ write on the destination — ordinary GCS permissions, nothing bespoke.
 from __future__ import annotations
 
 import datetime as _dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from typing import Callable
 
 from google.cloud import storage
 
-from ..integrity import IntegrityReport
-from .audit import _iter_slide_blobs, audit_object
+from ..integrity import IntegrityIssue, IntegrityReport
+from ..retry import is_transient, retry_transient
+from .audit import _audit_object_with_retry, _iter_slide_blobs
+
+# Mixed workload — the validation half is latency-bound like audit's, but rewrite() does
+# real server-side work per object, so this sits between batch's upload concurrency and
+# audit's — moderate default rather than audit's more aggressive one.
+DEFAULT_TRANSFER_WORKERS = 10
 
 
 @dataclass
 class TransferResult:
     source_uri: str
     dest_uri: str
-    copied: bool  # False if validation failed, so nothing was transferred
+    copied: bool  # False if validation failed (or was inconclusive), so nothing was transferred
     integrity_report: IntegrityReport
+
+    @property
+    def is_inconclusive(self) -> bool:
+        return self.integrity_report.is_inconclusive
 
 
 @dataclass
@@ -44,7 +56,11 @@ class TransferSummary:
 
     @property
     def skipped(self) -> list[TransferResult]:
-        return [r for r in self.results if not r.copied]
+        return [r for r in self.results if not r.copied and not r.is_inconclusive]
+
+    @property
+    def inconclusive(self) -> list[TransferResult]:
+        return [r for r in self.results if r.is_inconclusive]
 
 
 def _remap_key(key: str, *, prefix: str, dest_prefix: str | None) -> str:
@@ -70,7 +86,7 @@ def transfer_object(
     dest_uri = f"gs://{dest_bucket.name}/{key}"
     source_uri = f"gs://{source_blob.bucket.name}/{source_blob.name}"
 
-    report = audit_object(source_blob, deep=deep)
+    report = _audit_object_with_retry(source_blob, deep=deep)
     if not report.passed:
         return TransferResult(source_uri=source_uri, dest_uri=dest_uri, copied=False, integrity_report=report)
 
@@ -91,6 +107,33 @@ def transfer_object(
     return TransferResult(source_uri=source_uri, dest_uri=dest_uri, copied=True, integrity_report=report)
 
 
+_transfer_object_with_retry = retry_transient(transfer_object)
+
+
+def _transfer_object_safe(source_blob: storage.Blob, dest_bucket: storage.Bucket, *, dest_key: str, deep: bool) -> TransferResult:
+    try:
+        return _transfer_object_with_retry(source_blob, dest_bucket, dest_key=dest_key, deep=deep)
+    except Exception as exc:  # noqa: BLE001 - one bad object shouldn't kill the whole bucket transfer
+        source_uri = f"gs://{source_blob.bucket.name}/{source_blob.name}"
+        dest_uri = f"gs://{dest_bucket.name}/{dest_key}"
+        if is_transient(exc):
+            # Not a finding about the file — we couldn't finish transferring it after
+            # retries. Reporting this as "corrupted" would be actively misleading.
+            issue = IntegrityIssue(
+                check="transfer_incomplete",
+                severity="inconclusive",
+                message=f"could not complete the transfer after retries due to a network error: {exc} — re-run to get a verdict",
+            )
+        else:
+            issue = IntegrityIssue(check="transfer_error", severity="error", message=f"{type(exc).__name__}: {exc}")
+        return TransferResult(
+            source_uri=source_uri,
+            dest_uri=dest_uri,
+            copied=False,
+            integrity_report=IntegrityReport(location=source_uri, size_bytes=None, checks_run=[], issues=[issue]),
+        )
+
+
 def transfer_bucket(
     source_bucket_name: str,
     dest_bucket_name: str,
@@ -99,18 +142,38 @@ def transfer_bucket(
     dest_prefix: str | None = None,
     deep: bool = False,
     client: storage.Client | None = None,
+    workers: int = DEFAULT_TRANSFER_WORKERS,
+    on_start: Callable[[int], None] | None = None,
+    on_result: Callable[[TransferResult], None] | None = None,
 ) -> TransferSummary:
+    """`on_start`/`on_result` — see `audit_bucket`'s docstring; same purpose:
+    a caller can show live progress or write results out incrementally
+    instead of only learning anything once the whole transfer finishes.
+    """
     client = client or storage.Client()
     source_bucket = client.bucket(source_bucket_name)
     dest_bucket = client.bucket(dest_bucket_name)
 
-    results = [
-        transfer_object(
-            blob,
-            dest_bucket,
-            dest_key=_remap_key(blob.name, prefix=prefix, dest_prefix=dest_prefix),
-            deep=deep,
-        )
-        for blob in _iter_slide_blobs(source_bucket, prefix)
-    ]
+    blobs = list(_iter_slide_blobs(source_bucket, prefix))
+    if on_start is not None:
+        on_start(len(blobs))
+
+    results: list[TransferResult] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _transfer_object_safe,
+                blob,
+                dest_bucket,
+                dest_key=_remap_key(blob.name, prefix=prefix, dest_prefix=dest_prefix),
+                deep=deep,
+            )
+            for blob in blobs
+        ]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
+
     return TransferSummary(results=results)

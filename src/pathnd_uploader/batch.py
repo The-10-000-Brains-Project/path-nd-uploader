@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from google.cloud import storage
 
@@ -176,7 +177,13 @@ def run_batch(
     strict: bool = False,
     workers: int = DEFAULT_WORKERS,
     stability_wait_seconds: float = DEFAULT_STABILITY_WAIT_SECONDS,
+    on_result: Callable[[ItemResult], None] | None = None,
 ) -> list[ItemResult]:
+    """`on_result`, if given, is called with each item's result as soon as
+    it's ready (not batched to the end) — lets a caller show live progress
+    or write results out incrementally, e.g. so a long run's output survives
+    being interrupted partway instead of only being written at completion.
+    """
     schema = load_schema()  # load once up front; process_batch_item's default would reparse the cache key each call
     results: list[ItemResult] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -193,5 +200,8 @@ def run_batch(
             for item in items
         ]
         for future in as_completed(futures):
-            results.append(future.result())
+            result = future.result()
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
     return results

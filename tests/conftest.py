@@ -40,3 +40,17 @@ def truncated_slide_path(tmp_path, clean_slide_path):
     out = tmp_path / "truncated.svs"
     out.write_bytes(corrupted)
     return out
+
+
+@pytest.fixture
+def bare_truncated_slide_path(tmp_path, clean_slide_path):
+    """A copy of the clean fixture simply cut short — no zero-padding back
+    to the original size. The zero-tail heuristic can't see this (there's no
+    zero run, just an abrupt end), which is exactly what
+    check_structural_completeness exists to catch instead.
+    """
+    data = clean_slide_path.read_bytes()
+    cut = int(len(data) * 0.70)
+    out = tmp_path / "bare_truncated.svs"
+    out.write_bytes(data[:cut])
+    return out

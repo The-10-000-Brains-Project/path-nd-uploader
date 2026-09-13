@@ -82,13 +82,13 @@ def validate_slide(
     checks_run.append("file_stability")
 
     source = LocalFileSource(path)
-    issues = run_fast_checks(source, extension=path.suffix)
-    checks_run += ["header_magic", "zero_tail"]
+    issues, tech_metadata = run_fast_checks(source, extension=path.suffix)
+    checks_run += ["header_magic", "zero_tail", "structural_completeness"]
 
-    tech_metadata: dict = {}
     if deep and not any(i.severity == "error" for i in issues):
-        deep_issues, tech_metadata = run_deep_structural_check(path)
+        deep_issues, deep_metadata = run_deep_structural_check(path)
         issues += deep_issues
+        tech_metadata = {**tech_metadata, **deep_metadata}
         checks_run.append("deep_structural")
 
     return IntegrityReport(

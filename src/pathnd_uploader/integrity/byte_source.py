@@ -47,6 +47,50 @@ class LocalFileSource:
         return self._path
 
 
+class RangeReadFile:
+    """Adapts any `ByteRangeSource` into a minimal seekable file-like object
+    (read/seek/tell), so libraries that expect a file handle — e.g.
+    `tifffile`, to parse a TIFF's directory structure — can be pointed at a
+    remote GCS object and only fetch the small handful of bytes they
+    actually need, not the whole file.
+    """
+
+    def __init__(self, source: ByteRangeSource) -> None:
+        self._source = source
+        self._size = source.size()
+        self._pos = 0
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            n = self._size - self._pos
+        n = max(min(n, self._size - self._pos), 0)
+        if n == 0:
+            return b""
+        data = self._source.read_range(self._pos, n)
+        self._pos += len(data)
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        elif whence == 2:
+            self._pos = self._size + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+
 class GCSBlobSource:
     """Wraps a google.cloud.storage.Blob for range-read access.
 

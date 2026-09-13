@@ -1,5 +1,9 @@
-"""Serializes run results (from `batch.py` or `gcs/audit.py`) to JSON for
-machine consumption (CI, downstream reporting) and a short human summary.
+"""Serializes run results (from `batch.py`, `gcs/audit.py`, `gcs/transfer.py`)
+to JSON-lines, one object per line, written and flushed as each result
+completes — not batched into a single write at the end. A long run that gets
+interrupted (Ctrl-C, crash, laptop sleep) still leaves a usable, readable
+file behind, and the file can be tailed live (`tail -f`) from another
+terminal for progress feedback outside the main one.
 """
 
 from __future__ import annotations
@@ -11,6 +15,24 @@ from pathlib import Path
 from .batch import ItemResult
 from .gcs.transfer import TransferResult
 from .integrity import IntegrityReport
+
+
+class IncrementalReportWriter:
+    def __init__(self, path: Path):
+        self._file = open(path, "w", encoding="utf-8")
+
+    def write(self, data: dict) -> None:
+        self._file.write(json.dumps(data, default=str) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __enter__(self) -> "IncrementalReportWriter":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
 
 def item_result_to_dict(result: ItemResult) -> dict:
@@ -28,7 +50,7 @@ def item_result_to_dict(result: ItemResult) -> dict:
             "warnings": [asdict(e) for e in result.metadata_result.warnings],
         }
     if result.integrity_report:
-        d["integrity"] = _integrity_report_to_dict(result.integrity_report)
+        d["integrity"] = integrity_report_to_dict(result.integrity_report)
     if result.reconciliation:
         d["reconciliation"] = {
             "errors": [asdict(e) for e in result.reconciliation.errors],
@@ -39,7 +61,7 @@ def item_result_to_dict(result: ItemResult) -> dict:
     return d
 
 
-def _integrity_report_to_dict(report: IntegrityReport) -> dict:
+def integrity_report_to_dict(report: IntegrityReport) -> dict:
     return {
         "location": report.location,
         "size_bytes": report.size_bytes,
@@ -50,39 +72,10 @@ def _integrity_report_to_dict(report: IntegrityReport) -> dict:
     }
 
 
-def write_batch_report(results: list[ItemResult], path: Path) -> None:
-    payload = {
-        "total": len(results),
-        "passed": sum(1 for r in results if r.passed),
-        "failed": sum(1 for r in results if not r.passed),
-        "items": [item_result_to_dict(r) for r in results],
+def transfer_result_to_dict(result: TransferResult) -> dict:
+    return {
+        "source_uri": result.source_uri,
+        "dest_uri": result.dest_uri,
+        "copied": result.copied,
+        "integrity": integrity_report_to_dict(result.integrity_report),
     }
-    Path(path).write_text(json.dumps(payload, indent=2, default=str))
-
-
-def write_audit_report(reports: list[IntegrityReport], path: Path) -> None:
-    payload = {
-        "total_scanned": len(reports),
-        "passed": sum(1 for r in reports if r.passed),
-        "failed": sum(1 for r in reports if not r.passed),
-        "items": [_integrity_report_to_dict(r) for r in reports],
-    }
-    Path(path).write_text(json.dumps(payload, indent=2, default=str))
-
-
-def write_transfer_report(results: list[TransferResult], path: Path) -> None:
-    payload = {
-        "total": len(results),
-        "copied": sum(1 for r in results if r.copied),
-        "skipped": sum(1 for r in results if not r.copied),
-        "items": [
-            {
-                "source_uri": r.source_uri,
-                "dest_uri": r.dest_uri,
-                "copied": r.copied,
-                "integrity": _integrity_report_to_dict(r.integrity_report),
-            }
-            for r in results
-        ],
-    }
-    Path(path).write_text(json.dumps(payload, indent=2, default=str))

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class IntegrityIssue:
     check: str  # e.g. "zero_tail", "header_magic", "structural_open", "level_read", "path_missing"
-    severity: str  # "error" | "warning"
+    severity: str  # "error" | "warning" | "inconclusive"
     message: str
 
 
@@ -27,7 +27,17 @@ class IntegrityReport:
 
     @property
     def passed(self) -> bool:
-        return not any(i.severity == "error" for i in self.issues)
+        return not self.errors and not self.inconclusive_issues
+
+    @property
+    def is_inconclusive(self) -> bool:
+        """True when nothing was found to be actually wrong with the file,
+        but a network/transient error (after retries) meant it couldn't be
+        fully checked — distinct from `passed=False`, which means a real
+        finding about the file's content. Never both true at once: a real
+        error takes precedence in how a caller should react.
+        """
+        return not self.errors and bool(self.inconclusive_issues)
 
     @property
     def errors(self) -> list[IntegrityIssue]:
@@ -36,3 +46,7 @@ class IntegrityReport:
     @property
     def warnings(self) -> list[IntegrityIssue]:
         return [i for i in self.issues if i.severity == "warning"]
+
+    @property
+    def inconclusive_issues(self) -> list[IntegrityIssue]:
+        return [i for i in self.issues if i.severity == "inconclusive"]

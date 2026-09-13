@@ -1,5 +1,5 @@
 from pathnd_uploader.integrity.byte_source import LocalFileSource
-from pathnd_uploader.integrity.checks import check_header_magic, check_zero_tail
+from pathnd_uploader.integrity.checks import check_header_magic, check_zero_tail, run_fast_checks
 
 
 def _write(tmp_path, name, data: bytes):
@@ -72,3 +72,17 @@ def test_header_magic_skipped_for_non_tiff_formats(tmp_path):
     # .mrxs is not TIFF-based; the magic check shouldn't apply to it.
     source = LocalFileSource(_write(tmp_path, "f.mrxs", b"NOTA" + b"\x00" * 100))
     assert check_header_magic(source, extension=".mrxs") is None
+
+
+def test_run_fast_checks_returns_issues_and_tech_metadata(clean_slide_path):
+    source = LocalFileSource(clean_slide_path)
+    issues, tech_metadata = run_fast_checks(source, extension=".svs")
+    assert issues == []
+    assert tech_metadata["tiff_page_count"] == 4
+    assert tech_metadata["dimensions"] == (1024, 1024)
+
+
+def test_run_fast_checks_aggregates_issues_from_all_three_checks(bare_truncated_slide_path):
+    source = LocalFileSource(bare_truncated_slide_path)
+    issues, _ = run_fast_checks(source, extension=".svs")
+    assert any(i.check == "structural_completeness" for i in issues)

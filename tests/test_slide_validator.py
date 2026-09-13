@@ -25,6 +25,15 @@ def test_truncated_slide_is_caught_with_deep_validation_too(truncated_slide_path
     assert not report.passed
 
 
+def test_bare_truncation_with_no_zero_padding_is_caught_by_default(bare_truncated_slide_path):
+    # No --deep needed: check_structural_completeness (now part of the
+    # default fast checks) catches this via the TIFF directory alone, which
+    # the zero-tail heuristic can't since there's no zero-filled run here.
+    report = validate_slide(bare_truncated_slide_path, deep=False, stability_wait_seconds=0)
+    assert not report.passed
+    assert any(i.check == "structural_completeness" for i in report.issues)
+
+
 def test_missing_file_is_reported():
     report = validate_slide("/nonexistent/path/slide.svs", stability_wait_seconds=0)
     assert not report.passed

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import typer
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from .batch import (
     DEFAULT_STABILITY_WAIT_SECONDS,
@@ -14,39 +15,49 @@ from .batch import (
     run_batch,
 )
 from .config import get_bucket
-from .gcs.audit import audit_bucket, audit_manifest_against_bucket
-from .gcs.transfer import transfer_bucket
+from .gcs.audit import DEFAULT_AUDIT_WORKERS, audit_bucket, audit_manifest_against_bucket
+from .gcs.transfer import DEFAULT_TRANSFER_WORKERS, transfer_bucket
 from .mapping import PROFILES
 from .metadata import read_manifest
-from .report import write_audit_report, write_batch_report, write_transfer_report
+from .report import IncrementalReportWriter, integrity_report_to_dict, item_result_to_dict, transfer_result_to_dict
 from .schema import load_schema
 
 app = typer.Typer(help="Validate and upload pathology whole-slide images + CDE metadata to GCS.")
 
 
-def _print_item_result(result) -> None:
+def _progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+    )
+
+
+def _print_item_result(result, echo: Callable[[str], None] = typer.echo) -> None:
     status = "PASS" if result.passed else "FAIL"
-    typer.echo(f"[{status}] {result.slide_path}")
+    echo(f"[{status}] {result.slide_path}")
     if result.error:
-        typer.echo(f"    error: {result.error}")
+        echo(f"    error: {result.error}")
     if result.integrity_report:
         for issue in result.integrity_report.issues:
-            typer.echo(f"    [{issue.severity}] {issue.check}: {issue.message}")
+            echo(f"    [{issue.severity}] {issue.check}: {issue.message}")
     if result.metadata_result:
         for e in result.metadata_result.errors:
-            typer.echo(f"    [error] metadata.{e.field}: {e.message}")
+            echo(f"    [error] metadata.{e.field}: {e.message}")
         for r in result.metadata_result.needs_review:
-            typer.echo(f"    [NEEDS REVIEW] metadata.{r.field}: {r.message}")
+            echo(f"    [NEEDS REVIEW] metadata.{r.field}: {r.message}")
         for w in result.metadata_result.warnings:
-            typer.echo(f"    [warning] metadata.{w.field}: {w.message}")
+            echo(f"    [warning] metadata.{w.field}: {w.message}")
     if result.reconciliation:
         for e in result.reconciliation.errors:
-            typer.echo(f"    [error] reconcile.{e.field}: {e.message}")
+            echo(f"    [error] reconcile.{e.field}: {e.message}")
         for w in result.reconciliation.warnings:
-            typer.echo(f"    [warning] reconcile.{e.field}: {w.message}")
+            echo(f"    [warning] reconcile.{e.field}: {w.message}")
     if result.upload:
         note = " (skipped, already present)" if result.upload.skipped else ""
-        typer.echo(f"    uploaded -> {result.upload.object_uri}{note}")
+        echo(f"    uploaded -> {result.upload.object_uri}{note}")
 
 
 @app.command()
@@ -125,13 +136,29 @@ def batch_cmd(
         items = items_from_manifest(records, manifest_dir=source.parent, profile=source_profile)
 
     gcs_bucket = get_bucket(bucket) if bucket else None
-    results = run_batch(
-        items, bucket=gcs_bucket, deep=deep, strict=strict, workers=workers, stability_wait_seconds=stability_wait
-    )
-    for r in results:
-        _print_item_result(r)
-    if report:
-        write_batch_report(results, report)
+    report_writer = IncrementalReportWriter(report) if report else None
+
+    with _progress() as progress:
+        task = progress.add_task("Validating", total=len(items))
+
+        def on_result(result):
+            progress.update(task, advance=1)
+            _print_item_result(result, echo=progress.console.print)
+            if report_writer:
+                report_writer.write(item_result_to_dict(result))
+
+        results = run_batch(
+            items,
+            bucket=gcs_bucket,
+            deep=deep,
+            strict=strict,
+            workers=workers,
+            stability_wait_seconds=stability_wait,
+            on_result=on_result,
+        )
+
+    if report_writer:
+        report_writer.close()
     failed = sum(1 for r in results if not r.passed)
     typer.echo(f"\n{len(results) - failed}/{len(results)} passed")
     raise typer.Exit(code=0 if failed == 0 else 1)
@@ -142,6 +169,7 @@ def audit(
     bucket: str,
     prefix: str = typer.Option("", help="Only scan objects under this prefix"),
     deep: bool = typer.Option(False, help="Also download+re-open objects that pass the fast scan (expensive)"),
+    workers: int = typer.Option(DEFAULT_AUDIT_WORKERS, help="Parallel worker count"),
     manifest: Optional[Path] = typer.Option(
         None, "--manifest", help="Cross-reference a metadata manifest's slide_paths against bucket contents"
     ),
@@ -150,12 +178,27 @@ def audit(
     """Scans an already-populated bucket/prefix for corrupted (e.g.
     truncated/zero-filled) slide files, without downloading them by default.
     """
-    summary = audit_bucket(bucket, prefix=prefix, deep=deep)
-    for r in summary.reports:
-        status = "PASS" if r.passed else "FAIL"
-        typer.echo(f"[{status}] {r.location} ({r.size_bytes:,} bytes)")
-        for issue in r.issues:
-            typer.echo(f"    [{issue.severity}] {issue.check}: {issue.message}")
+    report_writer = IncrementalReportWriter(report) if report else None
+
+    with _progress() as progress:
+        task = progress.add_task("Listing bucket...", total=None)
+
+        def on_start(total: int) -> None:
+            progress.update(task, total=total, description="Scanning")
+
+        def on_result(r) -> None:
+            progress.update(task, advance=1)
+            status = "PASS" if r.passed else ("COULD NOT VERIFY" if r.is_inconclusive else "FAIL")
+            progress.console.print(f"[{status}] {r.location} ({r.size_bytes:,} bytes)")
+            for issue in r.issues:
+                progress.console.print(f"    [{issue.severity}] {issue.check}: {issue.message}")
+            if report_writer:
+                report_writer.write(integrity_report_to_dict(r))
+
+        summary = audit_bucket(bucket, prefix=prefix, deep=deep, workers=workers, on_start=on_start, on_result=on_result)
+
+    if report_writer:
+        report_writer.close()
 
     if manifest:
         missing = audit_manifest_against_bucket(read_manifest(manifest), bucket_name=bucket)
@@ -164,11 +207,9 @@ def audit(
             for m in missing:
                 typer.echo(f"    {m}")
 
-    if report:
-        write_audit_report(summary.reports, report)
-
-    typer.echo(f"\n{summary.total_scanned - len(summary.failed)}/{summary.total_scanned} passed")
-    raise typer.Exit(code=0 if not summary.failed else 1)
+    passed = summary.total_scanned - len(summary.failed) - len(summary.inconclusive)
+    typer.echo(f"\n{passed}/{summary.total_scanned} passed, {len(summary.failed)} failed, {len(summary.inconclusive)} could not be verified (re-run to get a verdict)")
+    raise typer.Exit(code=0 if not summary.failed and not summary.inconclusive else 1)
 
 
 @app.command()
@@ -180,6 +221,7 @@ def transfer(
         None, "--dest-prefix", help="Replace `--prefix` with this in the destination key (default: same key)"
     ),
     deep: bool = typer.Option(False, help="Download+fully validate each object before copying (expensive)"),
+    workers: int = typer.Option(DEFAULT_TRANSFER_WORKERS, help="Parallel worker count"),
     report: Optional[Path] = typer.Option(None, "--report", help="Write a JSON transfer report to this path"),
 ):
     """Copies validated slides from one GCS bucket to another (server-side —
@@ -188,18 +230,42 @@ def transfer(
     destination. Not the primary workflow; most uploads come from local
     files via `upload`/`batch`.
     """
-    summary = transfer_bucket(source_bucket, dest_bucket, prefix=prefix, dest_prefix=dest_prefix, deep=deep)
-    for r in summary.results:
-        status = "COPIED" if r.copied else "SKIPPED"
-        typer.echo(f"[{status}] {r.source_uri} -> {r.dest_uri}")
-        for issue in r.integrity_report.issues:
-            typer.echo(f"    [{issue.severity}] {issue.check}: {issue.message}")
+    report_writer = IncrementalReportWriter(report) if report else None
 
-    if report:
-        write_transfer_report(summary.results, report)
+    with _progress() as progress:
+        task = progress.add_task("Listing bucket...", total=None)
 
-    typer.echo(f"\n{len(summary.copied)}/{len(summary.results)} copied")
-    raise typer.Exit(code=0 if not summary.skipped else 1)
+        def on_start(total: int) -> None:
+            progress.update(task, total=total, description="Transferring")
+
+        def on_result(r) -> None:
+            progress.update(task, advance=1)
+            status = "COPIED" if r.copied else ("COULD NOT VERIFY" if r.is_inconclusive else "SKIPPED")
+            progress.console.print(f"[{status}] {r.source_uri} -> {r.dest_uri}")
+            for issue in r.integrity_report.issues:
+                progress.console.print(f"    [{issue.severity}] {issue.check}: {issue.message}")
+            if report_writer:
+                report_writer.write(transfer_result_to_dict(r))
+
+        summary = transfer_bucket(
+            source_bucket,
+            dest_bucket,
+            prefix=prefix,
+            dest_prefix=dest_prefix,
+            deep=deep,
+            workers=workers,
+            on_start=on_start,
+            on_result=on_result,
+        )
+
+    if report_writer:
+        report_writer.close()
+
+    typer.echo(
+        f"\n{len(summary.copied)}/{len(summary.results)} copied, {len(summary.skipped)} skipped, "
+        f"{len(summary.inconclusive)} could not be verified (re-run to get a verdict)"
+    )
+    raise typer.Exit(code=0 if not summary.skipped and not summary.inconclusive else 1)
 
 
 schema_app = typer.Typer(help="Inspect the pinned CDE schema.")
