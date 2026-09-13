@@ -6,3 +6,7 @@ __pycache__/
 dist/
 build/
 .claude/
+
+# run/report output artifacts (written by --report), not source
+*.jsonl
+*_report.json
