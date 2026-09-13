@@ -27,7 +27,7 @@ dev = [
 ]
 
 [project.scripts]
-path-nd-uploader = "pathnd_uploader.cli:app"
+path-nd-uploader = "pathnd_uploader.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pathnd_uploader"]
