@@ -14,7 +14,7 @@ from __future__ import annotations
 import google.api_core.exceptions as gax_exceptions
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-TRANSIENT_EXCEPTIONS = (
+_TRANSIENT: list[type[BaseException]] = [
     gax_exceptions.RetryError,
     gax_exceptions.ServiceUnavailable,
     gax_exceptions.TooManyRequests,
@@ -23,7 +23,23 @@ TRANSIENT_EXCEPTIONS = (
     gax_exceptions.GatewayTimeout,
     ConnectionError,
     TimeoutError,
-)
+]
+
+# google-cloud-storage runs on `requests` under the hood, and its HTTP-layer
+# timeouts (e.g. requests.exceptions.ReadTimeout) subclass neither the
+# google.api_core exceptions nor Python's built-in TimeoutError — so without
+# this they were misclassified as hard failures. A read timeout mid-transfer
+# is transient: retry it, and if it still fails, report it as inconclusive
+# (not "corrupted"/"skipped"). Observed for real: 40 objects in a 715-object
+# cross-region transfer failed this way and were wrongly marked SKIPPED.
+try:
+    import requests.exceptions as _req_exc
+
+    _TRANSIENT += [_req_exc.Timeout, _req_exc.ConnectionError, _req_exc.ChunkedEncodingError]
+except ImportError:  # pragma: no cover - requests is a google-cloud-storage dependency, always present
+    pass
+
+TRANSIENT_EXCEPTIONS = tuple(_TRANSIENT)
 
 
 def is_transient(exc: BaseException) -> bool:
