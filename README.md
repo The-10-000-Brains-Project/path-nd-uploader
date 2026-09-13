@@ -2,11 +2,41 @@
 
 # path-nd-uploader
 
-Validates pathology whole-slide images and their metadata before uploading
-to Google Cloud Storage. Checks that the slide file isn't corrupted (e.g.
-truncated mid-upload) and that its metadata matches the
+Checks that a pathology whole-slide image is intact — not truncated or
+zero-filled — before it's uploaded to Google Cloud Storage, and that its
+metadata matches the
 [Path-ND CDE schema](https://github.com/The-10-000-Brains-Project/pathnd-cdes).
-Nothing gets uploaded unless both pass.
+Nothing uploads unless both pass. It can also scan a bucket that's already
+been uploaded to.
+
+## What it checks on a slide
+
+Two tiers. The **fast checks run by default** — a few small reads, no full
+download, cheap enough to run against every file in a bucket. The **deep
+check is opt-in** (`--deep`) and needs the whole file on local disk.
+
+**Fast checks (default):**
+
+| Check | What it confirms | Fails when |
+|---|---|---|
+| **TIFF header** | The file starts with a valid TIFF magic number (classic or BigTIFF, either byte order). TIFF-based formats only (`.svs .tif .tiff .ndpi .scn`). | The file is under 4 bytes, or the first bytes aren't a TIFF magic number. |
+| **Zero-tail** | The end of the file isn't a long run of zero bytes. Reads the last 64 MiB and measures the actual trailing zero run. | The trailing zero run is larger than `max(1 MiB, 0.5% of file size)`, or the file is 0 bytes. This is the signature of an interrupted upload — including a file that was zero-padded back to its original length, which passes a size check but fails here. |
+| **Structural completeness** | Every TIFF page's tile/strip data fits inside the file's actual size. Parses the TIFF directory over range reads, never the whole file. TIFF-based formats only. | A page claims bytes past the end of the file (physically short / cut-off copy), the directory can't be parsed, there are no readable pages, or the first page is smaller than 512×512. |
+
+Supported non-TIFF formats (`.mrxs`, `.vms`, `.vmu`, `.bif`) get the
+zero-tail check only; the header and structural checks are TIFF-specific and
+skipped.
+
+**Deep check (`--deep`, local files only, needs OpenSlide):**
+
+Opens the slide with OpenSlide, walks every pyramid level, and reads a small
+region at the far corner of each level — the part that goes missing first if
+a write was cut off. Fails on an open error, zero pyramid levels,
+implausibly small dimensions, or any level that can't be read.
+
+**What it does not check:** image or diagnostic quality — focus, staining,
+artifacts, tissue coverage. That's a separate job (e.g. HistoQC). This tool
+answers one question: is the file whole and structurally intact?
 
 ## Setup
 
@@ -21,84 +51,53 @@ gcloud auth login
 gcloud auth application-default login
 ```
 
-(Both logins are needed — different parts of the tool use different
-credential stores.) Run `source .venv/bin/activate` again each new terminal
-session.
-
-Check it worked:
-
-```bash
-path-nd-uploader schema show
-```
-
-## Metadata
-
-Most brain banks already have a spreadsheet — one row per slide. Point
-`batch` at it directly (CSV, JSON, or xlsx):
-
-```csv
-participant_id,brain_bank_id,study,slide_paths,stain_type
-P-00231,BB-4471,Path-ND,slide001.svs,HE
-P-00232,BB-4472,Path-ND,slide002.svs,AT8
-```
-
-`participant_id`, `brain_bank_id`, `study`, `slide_paths`, `stain_type` are
-required. Full field list: `path-nd-uploader schema show`.
-
-If your spreadsheet uses different column names (e.g. BDR's raw export),
-pass `--profile bdr` and it's translated automatically — see
-`path-nd-uploader batch --help` for available profiles.
-
-There's no per-slide metadata file format — `slide_paths` in the manifest
-is what links a row to its file. For a single slide, `--metadata` just
-takes a manifest with one row (a one-line CSV works fine).
+Both logins are needed — different parts of the tool use different
+credential stores. Re-run `source .venv/bin/activate` in each new terminal.
 
 ## Commands
 
 ```bash
-# Batch: point at a manifest (CSV/JSON/xlsx). Omit --bucket to only validate.
+# Validate + upload a batch from a manifest (CSV/JSON/xlsx). Omit --bucket to only validate.
 path-nd-uploader batch metadata.csv --bucket my-bucket --report run_report.jsonl
 
-# Or a directory of slide files, with no metadata (integrity-only check)
+# A directory of slides, no metadata — integrity check only
 path-nd-uploader batch ./incoming
 
-# Check or upload a single slide (--metadata is a one-row manifest; omit it
-# on validate for an integrity-only check)
+# A single slide
 path-nd-uploader validate slide001.svs --metadata slide001.csv
 path-nd-uploader upload slide001.svs --metadata slide001.csv --bucket my-bucket
 
-# Scan a bucket already uploaded to, for corruption
+# Scan an already-uploaded bucket for corruption (add --deep for the pyramid walk)
 path-nd-uploader audit my-bucket --prefix Collection_PART/ --report audit_report.jsonl
 
-# Copy already-uploaded slides between buckets (server-side, validates first)
+# Copy slides between buckets, server-side, integrity-checked first
 path-nd-uploader transfer source-bucket dest-bucket --prefix Collection_PART/
 ```
 
 `validate`/`upload` print `[PASS]` or `[FAIL]` with the reason. `batch`,
-`audit`, and `transfer` show live progress and write `--report` as
-JSON-lines incrementally, so it survives an interrupted run.
+`audit`, and `transfer` show live progress and write `--report` as JSON-lines
+incrementally, so the file survives an interrupted run. `[COULD NOT VERIFY]`
+means a network error interrupted the check, not a finding about the file —
+re-run it.
 
-`[NEEDS REVIEW]` means something couldn't be auto-resolved but doesn't
-block the upload — a human should check it later.
+## Metadata
 
-`[COULD NOT VERIFY]` means a network error interrupted the check — it's not
-a finding about the file. Re-run to get a real answer.
+Most brain banks already have a spreadsheet, one row per slide. Point `batch`
+at it directly (CSV, JSON, or xlsx):
 
-## Troubleshooting
+```csv
+participant_id,brain_bank_id,study,slide_paths,stain_type
+P-00231,BB-4471,Path-ND,slide001.svs,HE
+```
 
-| You see | Fix |
-|---|---|
-| `command not found: path-nd-uploader` | `source .venv/bin/activate` |
-| `gcloud storage cp failed ... Reauthentication is needed` | `gcloud auth login` |
-| Other auth/permission error | `gcloud auth application-default login`, and check bucket access |
-| `[error] zero_tail: ...` | The slide file is corrupted/truncated — re-copy the original, don't retry the same file |
-| `[error] reconcile.slide_paths: ...` | Metadata's `slide_paths` doesn't match the file being uploaded, or points nowhere |
+`participant_id`, `brain_bank_id`, `study`, `slide_paths`, `stain_type` are
+required; `slide_paths` links each row to its file. Full field list:
+`path-nd-uploader schema show`. If your export uses different column names,
+pass `--profile bdr` (see `path-nd-uploader batch --help` for profiles).
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
 pytest
-
-scripts/update_schema.sh v1.1.0   # update the pinned CDE schema
 ```
