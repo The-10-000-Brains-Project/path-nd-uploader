@@ -2,78 +2,39 @@
 
 # path-nd-uploader
 
-A command-line tool for sending pathology whole-slide images (`.svs` and
-similar formats) to Google Cloud Storage. Before anything is uploaded, it
-checks two things:
+Validates pathology whole-slide images and their metadata before uploading
+to Google Cloud Storage. Checks that the slide file isn't corrupted (e.g.
+truncated mid-upload) and that its metadata matches the
+[Path-ND CDE schema](https://github.com/The-10-000-Brains-Project/pathnd-cdes).
+Nothing gets uploaded unless both pass.
 
-1. **The slide file itself isn't corrupted** — most importantly, that it
-   wasn't cut off partway through an upload (a real failure mode this tool
-   was built to catch: an interrupted upload left a slide with its last
-   10-20% zero-filled and unreadable, sitting undetected in a bucket).
-2. **The metadata describing the slide is complete and correctly formatted**,
-   checked against the standardized
-   [Path-ND CDE schema](https://github.com/The-10-000-Brains-Project/pathnd-cdes).
+## Setup
 
-Anything that fails either check is not uploaded — you'll see exactly why,
-so you can fix it and try again.
-
-## Before you start
-
-You'll need:
-
-- **Python 3.10 or newer.** Check with `python3 --version` in a terminal;
-  if that fails, install it from [python.org](https://www.python.org/downloads/).
-- **Access to the destination Google Cloud Storage bucket**, and the
-  `gcloud` command-line tool installed ([instructions](https://cloud.google.com/sdk/docs/install)) —
-  needed once, for the sign-in step below.
-- This project's folder, on your computer, and a terminal open **inside it**
-  (e.g. `cd path/to/uploader`).
-
-## One-time setup
-
-Run these once, in a terminal, from inside the project folder:
+Requires Python 3.10+ and the `gcloud` CLI.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install .
-```
 
-`source .venv/bin/activate` needs to be run again each time you open a new
-terminal window — you'll know it worked because your prompt starts with
-`(.venv)`.
-
-Then sign in to Google Cloud — **two separate logins**, both needed (this
-tool uses the `gcloud` CLI directly for the actual file transfer, since it
-handles large/unreliable uploads far more robustly than reimplementing that
-ourselves, and separately uses a Python library for everything else, which
-keeps its own credentials):
-
-```bash
 gcloud auth login
 gcloud auth application-default login
 ```
 
-Each opens a browser window to log in. You only need to do this once per
-computer (it may expire after a while — if commands below start failing
-with an authentication error, just run whichever of the two lines above
-matches the error).
+(Both logins are needed — different parts of the tool use different
+credential stores.) Run `source .venv/bin/activate` again each new terminal
+session.
 
-That's it — test it worked with:
+Check it worked:
 
 ```bash
 path-nd-uploader schema show
 ```
 
-You should see a field count and a version number. If you see
-`command not found` instead, the venv likely isn't activated — re-run the
-`source .venv/bin/activate` line above.
+## Metadata
 
-## Preparing your metadata
-
-Each slide needs a small JSON file describing it, with the same name as the
-slide but ending in `.json`. For a slide at `45122.svs`, create `45122.json`
-next to it:
+Each slide needs a `.json` sidecar with the same name. For `45122.svs`,
+create `45122.json`:
 
 ```json
 {
@@ -87,132 +48,59 @@ next to it:
 }
 ```
 
-`participant_id`, `brain_bank_id`, `study`, `slide_paths`, and `stain_type`
-are required on every slide. To see the full, current list of fields (this
-can change over time), run:
+`participant_id`, `brain_bank_id`, `study`, `slide_paths`, `stain_type` are
+required. Full field list: `path-nd-uploader schema show`.
+
+Have a spreadsheet of metadata instead of per-slide JSON files? `batch`
+below reads a CSV/JSON/xlsx manifest directly. If it's a raw institutional
+export with different field names (e.g. BDR), pass `--profile bdr` and it's
+translated automatically — see `path-nd-uploader batch --help` for
+available profiles.
+
+## Commands
 
 ```bash
-path-nd-uploader schema show
-```
-
-**Already have a spreadsheet of slide metadata instead** (one row per
-slide, covering many slides at once)? You don't need to create individual
-JSON files — see [Uploading many slides at once](#uploading-many-slides-at-once)
-below, which reads a CSV directly.
-
-**Coming from a brain bank whose export doesn't already match the field
-names above** (e.g. BDR's raw export uses `donor_id`, `GENDER`, `slide_name`,
-etc. instead)? See [Raw institutional exports](#raw-institutional-exports)
-below.
-
-## Everyday commands
-
-**Check a slide before uploading anything** (safe to run as many times as
-you like — it never touches the cloud):
-
-```bash
+# Check one slide (no upload)
 path-nd-uploader validate 45122.svs --metadata 45122.json
+
+# Upload one slide (only if validation passes)
+path-nd-uploader upload 45122.svs --metadata 45122.json --bucket my-bucket
+
+# Batch: a folder of slide+.json pairs, or a manifest. Omit --bucket to only validate.
+path-nd-uploader batch ./incoming --bucket my-bucket --report run_report.jsonl
+
+# Scan a bucket already uploaded to, for corruption
+path-nd-uploader audit my-bucket --prefix Collection_PART/ --report audit_report.jsonl
+
+# Copy already-uploaded slides between buckets (server-side, validates first)
+path-nd-uploader transfer source-bucket dest-bucket --prefix Collection_PART/
 ```
 
-```
-[PASS] 45122.svs
-```
+`validate`/`upload` print `[PASS]` or `[FAIL]` with the reason. `batch`,
+`audit`, and `transfer` show live progress and write `--report` as
+JSON-lines incrementally, so it survives an interrupted run.
 
-If something's wrong, you'll see exactly what and where, for example a
-slide that was cut off mid-upload:
+`[NEEDS REVIEW]` means something couldn't be auto-resolved but doesn't
+block the upload — a human should check it later.
 
-```
-[FAIL] 45122.svs
-    [error] zero_tail: last 1,253,880 bytes (30.0% of the file) are zero-filled — likely a truncated/interrupted upload; the pyramid directory is probably unreachable
-```
-
-**Upload one slide** (only actually uploads if validation passes):
-
-```bash
-path-nd-uploader upload 45122.svs --metadata 45122.json --bucket my-bucket-name
-```
-
-### Uploading many slides at once
-
-Point it at a folder containing your slide + `.json` pairs, or at a CSV/JSON
-manifest with one row per slide:
-
-```bash
-path-nd-uploader batch ./incoming --bucket my-bucket-name --report run_report.json
-```
-
-`--report run_report.json` saves a detailed record of what passed, what
-failed, and why — worth keeping for your own records. Omit `--bucket` to
-only validate the whole batch without uploading anything yet.
-
-### Checking a bucket that's already been uploaded to
-
-To scan slides already sitting in a bucket for the same kind of corruption
-(without re-downloading everything):
-
-```bash
-path-nd-uploader audit my-bucket-name --prefix Collection_PART/ --report audit_report.json
-```
-
-### Raw institutional exports
-
-If your metadata comes from a system that doesn't already use this
-project's field names (for example, BDR's raw CSV export), pass
-`--profile <name>` and the tool will translate it automatically:
-
-```bash
-path-nd-uploader batch BDR_Slides_metadata.csv --bucket my-bucket-name --profile bdr
-```
-
-Run `path-nd-uploader batch --help` to see which profiles are available.
-
-### Moving slides between buckets
-
-Not the primary workflow (most uploads come from a local file via
-`upload`/`batch`), but if you need to copy already-uploaded slides from one
-bucket to another and have access to both, this copies server-side —
-data moves directly between the buckets, never through your machine — and
-validates each object first, skipping anything already corrupted:
-
-```bash
-path-nd-uploader transfer source-bucket-name dest-bucket-name --prefix Collection_PART/
-```
-
-## If you see `[NEEDS REVIEW]`
-
-This means something couldn't be automatically resolved and needs a human
-to look at it — but it does **not** block the upload. Common examples:
-a value that could plausibly mean two different things (so the tool refuses
-to guess), or a field the source system simply doesn't provide. Search for
-`needs_review` in your `--report` output to find every instance across a
-batch.
+`[COULD NOT VERIFY]` means a network error interrupted the check — it's not
+a finding about the file. Re-run to get a real answer.
 
 ## Troubleshooting
 
-| You see | What it means |
+| You see | Fix |
 |---|---|
-| `command not found: path-nd-uploader` | The virtual environment isn't activated — run `source .venv/bin/activate` (from inside the project folder) again. |
-| `gcloud storage cp failed ... Reauthentication is needed` | Run `gcloud auth login` again. |
-| An authentication/permission error NOT mentioning `gcloud storage cp` | Run `gcloud auth application-default login` again, and confirm you actually have access to the bucket you're targeting. |
-| `[error] zero_tail: ...` | The slide file itself is corrupted/truncated — usually from an interrupted upload or copy. Re-copy or re-scan the original slide; don't retry the same file. |
-| `[error] reconcile.slide_paths: ...` | The metadata's `slide_paths` doesn't match the file you're actually uploading, or points at a file that doesn't exist. |
-| `[NEEDS REVIEW] ...` | See [above](#if-you-see-needs-review) — doesn't block upload, but needs a human decision. |
+| `command not found: path-nd-uploader` | `source .venv/bin/activate` |
+| `gcloud storage cp failed ... Reauthentication is needed` | `gcloud auth login` |
+| Other auth/permission error | `gcloud auth application-default login`, and check bucket access |
+| `[error] zero_tail: ...` | The slide file is corrupted/truncated — re-copy the original, don't retry the same file |
+| `[error] reconcile.slide_paths: ...` | Metadata's `slide_paths` doesn't match the file being uploaded, or points nowhere |
 
-## For developers
-
-Update the pinned CDE schema (it's vendored, not fetched live, so
-validation results stay reproducible):
-
-```bash
-scripts/update_schema.sh v1.1.0   # or a commit SHA
-```
-
-Install with test dependencies and run the test suite:
+## Development
 
 ```bash
 pip install -e ".[dev]"
 pytest
-```
 
-Project layout, the mapping-profile framework, and the integrity-check
-internals are documented in module docstrings under `src/pathnd_uploader/`.
+scripts/update_schema.sh v1.1.0   # update the pinned CDE schema
+```
