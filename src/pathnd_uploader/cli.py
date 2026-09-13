@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
 import typer
+from google.api_core import exceptions as gapi_exceptions
+from google.auth import exceptions as gauth_exceptions
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from .batch import (
@@ -22,7 +25,14 @@ from .metadata import read_manifest, read_single_record
 from .report import IncrementalReportWriter, integrity_report_to_dict, item_result_to_dict, transfer_result_to_dict
 from .schema import load_schema
 
-app = typer.Typer(help="Validate and upload pathology whole-slide images + CDE metadata to GCS.")
+# pretty_exceptions_enable=False: Typer's default rich traceback turns any
+# error into a screen-filling wall that buries the actual cause. We render a
+# plain, actionable message for the common operational errors ourselves (see
+# main()); genuinely unexpected errors then show an ordinary short traceback.
+app = typer.Typer(
+    help="Validate and upload pathology whole-slide images + CDE metadata to GCS.",
+    pretty_exceptions_enable=False,
+)
 
 
 def _progress() -> Progress:
@@ -320,5 +330,44 @@ def schema_update(ref: str = typer.Argument(..., help="Git ref (tag or commit) i
     typer.echo("(kept as an explicit script rather than a CLI side-effect, so schema pins are a reviewable diff)")
 
 
+def _fail(message: str) -> None:
+    typer.secho(message, fg=typer.colors.RED, err=True)
+    raise SystemExit(2)
+
+
+def main() -> None:
+    """Console-script entry point. Wraps the Typer app so the common,
+    actionable Google Cloud errors surface as a plain one-line message with
+    the fix, instead of a screen-filling traceback. Anything unexpected still
+    raises normally so real bugs stay debuggable.
+    """
+    # The ADC "no quota project" UserWarning is benign and prints on every
+    # run — pure noise that makes normal output look alarming. Silence it.
+    warnings.filterwarnings("ignore", message=".*end user credentials.*")
+
+    try:
+        app()
+    except gauth_exceptions.RefreshError:
+        _fail(
+            "Your Google Cloud sign-in has expired.\n"
+            "  Fix: run  gcloud auth application-default login  then try again."
+        )
+    except gauth_exceptions.DefaultCredentialsError:
+        _fail(
+            "No Google Cloud credentials found on this machine.\n"
+            "  Fix: run  gcloud auth application-default login  then try again."
+        )
+    except gapi_exceptions.Forbidden as exc:
+        _fail(
+            f"Google Cloud denied access: {getattr(exc, 'message', exc)}\n"
+            "  Check that you have permission for that bucket."
+        )
+    except gapi_exceptions.NotFound as exc:
+        _fail(
+            f"Google Cloud couldn't find that: {getattr(exc, 'message', exc)}\n"
+            "  Check the bucket name and path."
+        )
+
+
 if __name__ == "__main__":
-    app()
+    main()
