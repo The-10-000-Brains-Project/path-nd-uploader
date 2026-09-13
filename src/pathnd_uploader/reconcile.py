@@ -39,8 +39,8 @@ def check_slide_path_exists(record: dict, resolved_path: Path) -> FieldError | N
 
 
 def check_uploaded_file_matches_metadata(record: dict, uploaded_path: Path) -> FieldError | None:
-    """Guards against a batch-run pairing bug: the sidecar being validated
-    is not actually the one for the file about to be uploaded.
+    """Guards against a batch-run pairing bug: the metadata record being
+    validated is not actually the one for the file about to be uploaded.
     """
     declared = record.get("slide_paths")
     if declared and Path(declared).name != uploaded_path.name:

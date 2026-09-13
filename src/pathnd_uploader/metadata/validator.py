@@ -84,8 +84,8 @@ def validate_metadata(
     strict: bool = False,
     downgrade_to_warning: frozenset[str] = frozenset(),
 ) -> ValidationResult:
-    """Validates one metadata record (e.g. the contents of a slide's JSON
-    sidecar) against the CDE schema.
+    """Validates one metadata record (e.g. one row of a manifest, for one
+    slide) against the CDE schema.
 
     In non-strict mode (default), fields present in the record but not in
     the schema are reported as warnings (likely typos) rather than errors,

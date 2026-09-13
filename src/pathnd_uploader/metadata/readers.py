@@ -1,4 +1,9 @@
-"""Loads metadata sidecars: one JSON object per slide, or a batch manifest."""
+"""Loads metadata manifests — always a manifest, never a per-slide sidecar
+file. Real institutional exports (BDR's CSV, Mount Sinai/PART's xlsx) are
+each one spreadsheet covering many slides; there's no supported format for
+a standalone `slide.json` next to `slide.svs`. For a single slide, use a
+manifest with one row (see `read_single_record`).
+"""
 
 from __future__ import annotations
 
@@ -7,10 +12,16 @@ import json
 from pathlib import Path
 
 
-def read_sidecar(path: Path) -> dict:
-    """Reads a single slide's metadata sidecar (JSON)."""
-    with Path(path).open(encoding="utf-8") as f:
-        return json.load(f)
+def read_single_record(path: Path, *, sheet: str | int | None = None) -> dict:
+    """Reads a manifest expected to hold exactly one slide's record — for
+    validating/uploading a single slide via a small manifest (a one-row CSV
+    or xlsx, or a JSON array with one object) rather than a per-slide
+    sidecar file.
+    """
+    records = read_manifest(path, sheet=sheet)
+    if len(records) != 1:
+        raise ValueError(f"{path} must contain exactly one record for a single-slide command, found {len(records)}")
+    return records[0]
 
 
 def read_manifest(path: Path, *, sheet: str | int | None = None) -> list[dict]:

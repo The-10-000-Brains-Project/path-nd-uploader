@@ -9,7 +9,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 from .batch import (
     DEFAULT_STABILITY_WAIT_SECONDS,
     BatchItem,
-    discover_pairs_in_directory,
+    discover_slides_in_directory,
     items_from_manifest,
     process_item,
     run_batch,
@@ -18,7 +18,7 @@ from .config import get_bucket
 from .gcs.audit import DEFAULT_AUDIT_WORKERS, audit_bucket, audit_manifest_against_bucket
 from .gcs.transfer import DEFAULT_TRANSFER_WORKERS, transfer_bucket
 from .mapping import PROFILES
-from .metadata import read_manifest
+from .metadata import read_manifest, read_single_record
 from .report import IncrementalReportWriter, integrity_report_to_dict, item_result_to_dict, transfer_result_to_dict
 from .schema import load_schema
 
@@ -33,6 +33,14 @@ def _progress() -> Progress:
         MofNCompleteColumn(),
         TimeElapsedColumn(),
     )
+
+
+def _read_single_record_or_exit(path: Path, *, sheet: Optional[str]) -> dict:
+    try:
+        return read_single_record(path, sheet=sheet)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=2) from None
 
 
 def _print_item_result(result, echo: Callable[[str], None] = typer.echo) -> None:
@@ -63,7 +71,10 @@ def _print_item_result(result, echo: Callable[[str], None] = typer.echo) -> None
 @app.command()
 def validate(
     slide_path: Path,
-    metadata: Optional[Path] = typer.Option(None, "--metadata", help="Path to the slide's JSON metadata sidecar"),
+    metadata: Optional[Path] = typer.Option(
+        None, "--metadata", help="A manifest (CSV/JSON/xlsx) with exactly one row, for this slide"
+    ),
+    sheet: Optional[str] = typer.Option(None, "--sheet", help="Worksheet name, for an .xlsx --metadata file"),
     deep: bool = typer.Option(True, help="Run the full OpenSlide structural check (in addition to the fast checks)"),
     strict: bool = typer.Option(False, help="Reject metadata fields not present in the CDE schema"),
     stability_wait: float = typer.Option(
@@ -73,7 +84,8 @@ def validate(
     ),
 ):
     """Dry-run validation only — no GCS calls. Exits non-zero on failure."""
-    result = process_item(slide_path, metadata, deep=deep, strict=strict, stability_wait_seconds=stability_wait)
+    record = _read_single_record_or_exit(metadata, sheet=sheet) if metadata else None
+    result = process_item(slide_path, record, deep=deep, strict=strict, stability_wait_seconds=stability_wait)
     _print_item_result(result)
     raise typer.Exit(code=0 if result.passed else 1)
 
@@ -82,7 +94,10 @@ def validate(
 def upload(
     slide_path: Path,
     bucket: str = typer.Option(..., "--bucket"),
-    metadata: Path = typer.Option(..., "--metadata", help="Path to the slide's JSON metadata sidecar"),
+    metadata: Path = typer.Option(
+        ..., "--metadata", help="A manifest (CSV/JSON/xlsx) with exactly one row, for this slide"
+    ),
+    sheet: Optional[str] = typer.Option(None, "--sheet", help="Worksheet name, for an .xlsx --metadata file"),
     deep: bool = typer.Option(True, help="Run the full OpenSlide structural check before uploading"),
     strict: bool = typer.Option(False, help="Reject metadata fields not present in the CDE schema"),
     stability_wait: float = typer.Option(
@@ -93,8 +108,9 @@ def upload(
 ):
     """Validates one slide + its metadata, then uploads only if validation passes."""
     gcs_bucket = get_bucket(bucket)
+    record = _read_single_record_or_exit(metadata, sheet=sheet)
     result = process_item(
-        slide_path, metadata, bucket=gcs_bucket, deep=deep, strict=strict, stability_wait_seconds=stability_wait
+        slide_path, record, bucket=gcs_bucket, deep=deep, strict=strict, stability_wait_seconds=stability_wait
     )
     _print_item_result(result)
     raise typer.Exit(code=0 if result.passed else 1)
@@ -103,7 +119,7 @@ def upload(
 @app.command(name="batch")
 def batch_cmd(
     source: Path = typer.Argument(
-        ..., help="A directory of slide+.json pairs, or a manifest (.csv/.json/.jsonl/.xlsx)"
+        ..., help="A manifest (.csv/.json/.jsonl/.xlsx), or a directory for an integrity-only scan with no metadata"
     ),
     bucket: Optional[str] = typer.Option(None, "--bucket", help="Upload on success; omit to only validate"),
     workers: int = typer.Option(6, help="Parallel worker count"),
@@ -124,7 +140,7 @@ def batch_cmd(
 ):
     """Validates (and optionally uploads) many slides at once."""
     if source.is_dir():
-        items: list[BatchItem] = discover_pairs_in_directory(source)
+        items: list[BatchItem] = discover_slides_in_directory(source)
     else:
         source_profile = None
         if profile is not None:

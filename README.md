@@ -33,41 +33,39 @@ path-nd-uploader schema show
 
 ## Metadata
 
-Each slide needs a `.json` sidecar with the same name. For `45122.svs`,
-create `45122.json`:
+Most brain banks already have a spreadsheet — one row per slide. Point
+`batch` at it directly (CSV, JSON, or xlsx):
 
-```json
-{
-  "participant_id": "P-00231",
-  "brain_bank_id": "BB-4471",
-  "study": "Path-ND",
-  "slide_paths": "45122.svs",
-  "stain_type": "HE",
-  "scanner_manufacturer": "Leica",
-  "scanner_objective_magnification": "40"
-}
+```csv
+participant_id,brain_bank_id,study,slide_paths,stain_type
+P-00231,BB-4471,Path-ND,slide001.svs,HE
+P-00232,BB-4472,Path-ND,slide002.svs,AT8
 ```
 
 `participant_id`, `brain_bank_id`, `study`, `slide_paths`, `stain_type` are
 required. Full field list: `path-nd-uploader schema show`.
 
-Have a spreadsheet of metadata instead of per-slide JSON files? `batch`
-below reads a CSV/JSON/xlsx manifest directly. If it's a raw institutional
-export with different field names (e.g. BDR), pass `--profile bdr` and it's
-translated automatically — see `path-nd-uploader batch --help` for
-available profiles.
+If your spreadsheet uses different column names (e.g. BDR's raw export),
+pass `--profile bdr` and it's translated automatically — see
+`path-nd-uploader batch --help` for available profiles.
+
+There's no per-slide metadata file format — `slide_paths` in the manifest
+is what links a row to its file. For a single slide, `--metadata` just
+takes a manifest with one row (a one-line CSV works fine).
 
 ## Commands
 
 ```bash
-# Check one slide (no upload)
-path-nd-uploader validate 45122.svs --metadata 45122.json
+# Batch: point at a manifest (CSV/JSON/xlsx). Omit --bucket to only validate.
+path-nd-uploader batch metadata.csv --bucket my-bucket --report run_report.jsonl
 
-# Upload one slide (only if validation passes)
-path-nd-uploader upload 45122.svs --metadata 45122.json --bucket my-bucket
+# Or a directory of slide files, with no metadata (integrity-only check)
+path-nd-uploader batch ./incoming
 
-# Batch: a folder of slide+.json pairs, or a manifest. Omit --bucket to only validate.
-path-nd-uploader batch ./incoming --bucket my-bucket --report run_report.jsonl
+# Check or upload a single slide (--metadata is a one-row manifest; omit it
+# on validate for an integrity-only check)
+path-nd-uploader validate slide001.svs --metadata slide001.csv
+path-nd-uploader upload slide001.svs --metadata slide001.csv --bucket my-bucket
 
 # Scan a bucket already uploaded to, for corruption
 path-nd-uploader audit my-bucket --prefix Collection_PART/ --report audit_report.jsonl

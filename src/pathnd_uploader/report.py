@@ -38,7 +38,6 @@ class IncrementalReportWriter:
 def item_result_to_dict(result: ItemResult) -> dict:
     d = {
         "slide_path": result.slide_path,
-        "metadata_path": result.metadata_path,
         "passed": result.passed,
         "error": result.error,
     }

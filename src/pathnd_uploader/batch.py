@@ -3,6 +3,13 @@
 Single-item and batch runs share this same per-item pipeline; batch mode
 just fans it out across a thread pool (the work is I/O-bound: hashing large
 files and uploading them) and aggregates results into one report.
+
+Metadata always comes from a manifest row (a dict) — there's no supported
+per-slide sidecar-file format. Every real institutional export examined
+(BDR's CSV, Mount Sinai/PART's xlsx) is one spreadsheet covering many
+slides, not a file per slide; a standalone `slide.json` next to `slide.svs`
+was an earlier design guess with no real-world basis, and has been removed.
+For a single slide, pass a manifest with one row.
 """
 
 from __future__ import annotations
@@ -17,7 +24,7 @@ from google.cloud import storage
 from .gcs.uploader import UploadResult, upload_slide
 from .integrity import IntegrityReport
 from .mapping import SourceProfile, apply_profile
-from .metadata import ValidationResult, read_sidecar, resolve_slide_path, validate_metadata
+from .metadata import ValidationResult, resolve_slide_path, validate_metadata
 from .reconcile import ReconciliationResult, check_slide_path_exists, reconcile
 from .schema import Schema, load_schema
 from .slide import validate_slide
@@ -29,18 +36,16 @@ DEFAULT_WORKERS = 6
 
 @dataclass
 class BatchItem:
-    """One unit of work: a slide plus however its metadata was sourced."""
+    """One unit of work: a slide, and optionally its metadata record."""
 
     slide_path: Path | None  # None when the manifest row has no resolvable slide_paths at all
-    metadata_path: Path | None = None  # set when metadata came from a standalone sidecar file
-    record: dict | None = None  # set directly when metadata came from a manifest row
+    record: dict | None = None  # a manifest row; None means integrity-only, no metadata to check
     known_gaps: frozenset[str] = frozenset()  # from the source profile, if any — see SourceProfile.known_gaps
 
 
 @dataclass
 class ItemResult:
     slide_path: str
-    metadata_path: str | None = None
     metadata_result: ValidationResult | None = None
     integrity_report: IntegrityReport | None = None
     reconciliation: ReconciliationResult | None = None
@@ -75,19 +80,15 @@ def process_batch_item(
         declared = (item.record or {}).get("slide_paths")
         return ItemResult(
             slide_path=f"<unresolved: slide_paths={declared!r}>",
-            metadata_path=str(item.metadata_path) if item.metadata_path else None,
             error="no resolvable slide_paths in this record — nothing to validate or upload",
         )
 
     slide_path = Path(item.slide_path)
-    result = ItemResult(
-        slide_path=str(slide_path),
-        metadata_path=str(item.metadata_path) if item.metadata_path else None,
-    )
+    result = ItemResult(slide_path=str(slide_path))
 
     try:
-        has_metadata = item.metadata_path is not None or item.record is not None
-        record = item.record if item.record is not None else (read_sidecar(item.metadata_path) if item.metadata_path else {})
+        record = item.record or {}
+        has_metadata = item.record is not None
         if has_metadata:
             result.metadata_result = validate_metadata(
                 record, schema=schema, strict=strict, downgrade_to_warning=item.known_gaps
@@ -115,7 +116,7 @@ def process_batch_item(
 
 def process_item(
     slide_path: Path,
-    metadata_path: Path | None,
+    record: dict | None,
     *,
     schema: Schema | None = None,
     bucket: storage.Bucket | None = None,
@@ -123,9 +124,12 @@ def process_item(
     strict: bool = False,
     stability_wait_seconds: float = DEFAULT_STABILITY_WAIT_SECONDS,
 ) -> ItemResult:
-    """Single-item convenience wrapper around `process_batch_item`."""
+    """Single-item convenience wrapper around `process_batch_item`. `record`
+    is an already-loaded metadata dict (e.g. the one row of a manifest for
+    this slide) — pass None to run an integrity-only check with no metadata.
+    """
     return process_batch_item(
-        BatchItem(slide_path=Path(slide_path), metadata_path=metadata_path),
+        BatchItem(slide_path=Path(slide_path), record=record),
         schema=schema,
         bucket=bucket,
         deep=deep,
@@ -134,16 +138,13 @@ def process_item(
     )
 
 
-def discover_pairs_in_directory(directory: Path) -> list[BatchItem]:
-    """Pairs each supported slide file with a same-stem `.json` sidecar, if present."""
+def discover_slides_in_directory(directory: Path) -> list[BatchItem]:
+    """Finds supported slide files in a directory for an integrity-only scan
+    — no metadata is inferred. Pass a manifest (with `--profile` if it's a
+    raw institutional export) if you also want metadata validated.
+    """
     directory = Path(directory)
-    items = []
-    for slide_path in sorted(directory.iterdir()):
-        if slide_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-        sidecar = slide_path.with_suffix(".json")
-        items.append(BatchItem(slide_path=slide_path, metadata_path=sidecar if sidecar.exists() else None))
-    return items
+    return [BatchItem(slide_path=p) for p in sorted(directory.iterdir()) if p.suffix.lower() in SUPPORTED_EXTENSIONS]
 
 
 def items_from_manifest(
