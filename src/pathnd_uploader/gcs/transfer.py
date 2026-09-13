@@ -38,12 +38,20 @@ DEFAULT_TRANSFER_WORKERS = 10
 class TransferResult:
     source_uri: str
     dest_uri: str
-    copied: bool  # False if validation failed (or was inconclusive), so nothing was transferred
+    copied: bool  # True if this run performed the copy
     integrity_report: IntegrityReport
+    already_present: bool = False  # dest already held a byte-identical copy — an idempotent no-op success
 
     @property
     def is_inconclusive(self) -> bool:
         return self.integrity_report.is_inconclusive
+
+    @property
+    def in_destination(self) -> bool:
+        """True if the object is now in the destination — whether this run
+        copied it or it was already there. Both are successes.
+        """
+        return self.copied or self.already_present
 
 
 @dataclass
@@ -55,8 +63,14 @@ class TransferSummary:
         return [r for r in self.results if r.copied]
 
     @property
+    def already_present(self) -> list[TransferResult]:
+        return [r for r in self.results if r.already_present]
+
+    @property
     def skipped(self) -> list[TransferResult]:
-        return [r for r in self.results if not r.copied and not r.is_inconclusive]
+        # skipped = a real problem stopped the copy (validation failed), not
+        # an idempotent no-op and not a transient/inconclusive error
+        return [r for r in self.results if not r.in_destination and not r.is_inconclusive]
 
     @property
     def inconclusive(self) -> list[TransferResult]:
@@ -81,10 +95,24 @@ def transfer_object(
     """Validates `source_blob` (fast scan by default, `deep=True` downloads
     it for the full structural check), then server-side copies it to
     `dest_bucket` only if that passes. Skips the copy entirely otherwise.
+
+    Idempotent: if the destination already holds a byte-identical object
+    (same crc32c — which a rewrite preserves), it's left untouched and no
+    re-copy happens. This is what makes a large interrupted transfer safe to
+    re-run without re-paying cross-region egress on everything already done.
+    The existence check comes first, before validation, so a resumed run
+    doesn't even re-read already-copied source objects.
     """
     key = dest_key or source_blob.name
     dest_uri = f"gs://{dest_bucket.name}/{key}"
     source_uri = f"gs://{source_blob.bucket.name}/{source_blob.name}"
+
+    existing = dest_bucket.get_blob(key)
+    if existing is not None and existing.crc32c is not None and existing.crc32c == source_blob.crc32c:
+        report = IntegrityReport(location=source_uri, size_bytes=source_blob.size, checks_run=[], issues=[])
+        return TransferResult(
+            source_uri=source_uri, dest_uri=dest_uri, copied=False, already_present=True, integrity_report=report
+        )
 
     report = _audit_object_with_retry(source_blob, deep=deep)
     if not report.passed:

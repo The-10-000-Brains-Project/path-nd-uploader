@@ -256,7 +256,14 @@ def transfer(
 
         def on_result(r) -> None:
             progress.update(task, advance=1)
-            status = "COPIED" if r.copied else ("COULD NOT VERIFY" if r.is_inconclusive else "SKIPPED")
+            if r.copied:
+                status = "COPIED"
+            elif r.already_present:
+                status = "ALREADY PRESENT"
+            elif r.is_inconclusive:
+                status = "COULD NOT VERIFY"
+            else:
+                status = "SKIPPED"
             progress.console.print(f"[{status}] {r.source_uri} -> {r.dest_uri}")
             for issue in r.integrity_report.issues:
                 progress.console.print(f"    [{issue.severity}] {issue.check}: {issue.message}")
@@ -278,8 +285,9 @@ def transfer(
         report_writer.close()
 
     typer.echo(
-        f"\n{len(summary.copied)}/{len(summary.results)} copied, {len(summary.skipped)} skipped, "
-        f"{len(summary.inconclusive)} could not be verified (re-run to get a verdict)"
+        f"\n{len(summary.copied)} copied, {len(summary.already_present)} already present, "
+        f"{len(summary.skipped)} skipped, {len(summary.inconclusive)} could not be verified "
+        f"(re-run to get a verdict)  [of {len(summary.results)} total]"
     )
     raise typer.Exit(code=0 if not summary.skipped and not summary.inconclusive else 1)
 
