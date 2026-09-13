@@ -237,14 +237,22 @@ def transfer(
         None, "--dest-prefix", help="Replace `--prefix` with this in the destination key (default: same key)"
     ),
     deep: bool = typer.Option(False, help="Download+fully validate each object before copying (expensive)"),
+    validate: bool = typer.Option(
+        True,
+        "--validate/--no-validate",
+        help="Integrity-check each source object before copying. --no-validate skips it (much faster for a "
+        "cross-region transfer of an already-audited source; the copy itself is still checksum-verified).",
+    ),
     workers: int = typer.Option(DEFAULT_TRANSFER_WORKERS, help="Parallel worker count"),
     report: Optional[Path] = typer.Option(None, "--report", help="Write a JSON transfer report to this path"),
 ):
-    """Copies validated slides from one GCS bucket to another (server-side —
-    data moves directly between buckets, not through this machine). Requires
-    your GCS identity to have read on the source and write on the
-    destination. Not the primary workflow; most uploads come from local
-    files via `upload`/`batch`.
+    """Copies slides from one GCS bucket to another. The copy is server-side
+    (bytes move bucket-to-bucket, not through this machine) and checksum-
+    verified. By default each source object is integrity-checked first, which
+    reads part of every object down to this machine — pass --no-validate to
+    skip that when the source has already been audited. Requires read on the
+    source and write on the destination. Not the primary workflow; most
+    uploads come from local files via `upload`/`batch`.
     """
     report_writer = IncrementalReportWriter(report) if report else None
 
@@ -276,6 +284,7 @@ def transfer(
             prefix=prefix,
             dest_prefix=dest_prefix,
             deep=deep,
+            validate=validate,
             workers=workers,
             on_start=on_start,
             on_result=on_result,

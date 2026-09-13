@@ -91,10 +91,20 @@ def transfer_object(
     *,
     dest_key: str | None = None,
     deep: bool = False,
+    validate: bool = True,
 ) -> TransferResult:
     """Validates `source_blob` (fast scan by default, `deep=True` downloads
     it for the full structural check), then server-side copies it to
     `dest_bucket` only if that passes. Skips the copy entirely otherwise.
+
+    `validate=False` skips the source integrity re-read entirely and goes
+    straight to the copy. Use it when the source has already been audited:
+    the fast scan reads a chunk of every source object *down to the client*
+    (the zero-tail window is tens of MiB per object), which on a large
+    cross-region transfer is a big, redundant egress tax — and the
+    server-side rewrite already guarantees the destination is byte-identical
+    to the source (crc32c preserved), so copy fidelity does not depend on
+    this re-read.
 
     Idempotent: if the destination already holds a byte-identical object
     (same crc32c — which a rewrite preserves), it's left untouched and no
@@ -106,17 +116,20 @@ def transfer_object(
     key = dest_key or source_blob.name
     dest_uri = f"gs://{dest_bucket.name}/{key}"
     source_uri = f"gs://{source_blob.bucket.name}/{source_blob.name}"
+    empty_report = IntegrityReport(location=source_uri, size_bytes=source_blob.size, checks_run=[], issues=[])
 
     existing = dest_bucket.get_blob(key)
     if existing is not None and existing.crc32c is not None and existing.crc32c == source_blob.crc32c:
-        report = IntegrityReport(location=source_uri, size_bytes=source_blob.size, checks_run=[], issues=[])
         return TransferResult(
-            source_uri=source_uri, dest_uri=dest_uri, copied=False, already_present=True, integrity_report=report
+            source_uri=source_uri, dest_uri=dest_uri, copied=False, already_present=True, integrity_report=empty_report
         )
 
-    report = _audit_object_with_retry(source_blob, deep=deep)
-    if not report.passed:
-        return TransferResult(source_uri=source_uri, dest_uri=dest_uri, copied=False, integrity_report=report)
+    if validate:
+        report = _audit_object_with_retry(source_blob, deep=deep)
+        if not report.passed:
+            return TransferResult(source_uri=source_uri, dest_uri=dest_uri, copied=False, integrity_report=report)
+    else:
+        report = empty_report
 
     dest_blob = dest_bucket.blob(key)
     token = None
@@ -138,9 +151,11 @@ def transfer_object(
 _transfer_object_with_retry = retry_transient(transfer_object)
 
 
-def _transfer_object_safe(source_blob: storage.Blob, dest_bucket: storage.Bucket, *, dest_key: str, deep: bool) -> TransferResult:
+def _transfer_object_safe(
+    source_blob: storage.Blob, dest_bucket: storage.Bucket, *, dest_key: str, deep: bool, validate: bool
+) -> TransferResult:
     try:
-        return _transfer_object_with_retry(source_blob, dest_bucket, dest_key=dest_key, deep=deep)
+        return _transfer_object_with_retry(source_blob, dest_bucket, dest_key=dest_key, deep=deep, validate=validate)
     except Exception as exc:  # noqa: BLE001 - one bad object shouldn't kill the whole bucket transfer
         source_uri = f"gs://{source_blob.bucket.name}/{source_blob.name}"
         dest_uri = f"gs://{dest_bucket.name}/{dest_key}"
@@ -169,6 +184,7 @@ def transfer_bucket(
     prefix: str = "",
     dest_prefix: str | None = None,
     deep: bool = False,
+    validate: bool = True,
     client: storage.Client | None = None,
     workers: int = DEFAULT_TRANSFER_WORKERS,
     on_start: Callable[[int], None] | None = None,
@@ -195,6 +211,7 @@ def transfer_bucket(
                 dest_bucket,
                 dest_key=_remap_key(blob.name, prefix=prefix, dest_prefix=dest_prefix),
                 deep=deep,
+                validate=validate,
             )
             for blob in blobs
         ]
