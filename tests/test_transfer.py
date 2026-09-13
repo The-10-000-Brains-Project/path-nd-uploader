@@ -2,8 +2,29 @@ from unittest.mock import MagicMock, patch
 
 import google.api_core.exceptions as gax_exceptions
 
-from pathnd_uploader.gcs.transfer import _remap_key, transfer_bucket, transfer_object
+from pathnd_uploader.gcs.transfer import TransferResult, _remap_key, transfer_bucket, transfer_object
 from pathnd_uploader.integrity import IntegrityIssue, IntegrityReport
+from pathnd_uploader.report import transfer_result_to_dict
+
+
+def test_report_dict_distinguishes_already_present_from_skipped():
+    # Regression: the saved report conflated already-present (success) with
+    # skipped (problem) because already_present was never serialized.
+    empty = IntegrityReport(location="gs://b/x.svs", size_bytes=1, checks_run=[], issues=[])
+    already = TransferResult("gs://s/x.svs", "gs://d/x.svs", copied=False, integrity_report=empty, already_present=True)
+    skipped = TransferResult(
+        "gs://s/y.svs",
+        "gs://d/y.svs",
+        copied=False,
+        integrity_report=IntegrityReport(
+            location="gs://b/y.svs",
+            size_bytes=1,
+            checks_run=[],
+            issues=[IntegrityIssue(check="zero_tail", severity="error", message="corrupt")],
+        ),
+    )
+    assert transfer_result_to_dict(already)["already_present"] is True
+    assert transfer_result_to_dict(skipped)["already_present"] is False
 
 
 def _passing_report():

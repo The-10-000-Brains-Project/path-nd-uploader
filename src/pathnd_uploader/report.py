@@ -76,5 +76,9 @@ def transfer_result_to_dict(result: TransferResult) -> dict:
         "source_uri": result.source_uri,
         "dest_uri": result.dest_uri,
         "copied": result.copied,
+        # recorded so a saved report can distinguish an idempotent no-op
+        # success (already there) from a real problem-skip — the live CLI
+        # tally already separates these, but the JSON report was conflating them
+        "already_present": result.already_present,
         "integrity": integrity_report_to_dict(result.integrity_report),
     }
