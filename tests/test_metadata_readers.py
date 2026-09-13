@@ -60,3 +60,38 @@ def test_read_single_record_rejects_zero_rows(tmp_path):
     path.write_text("participant_id,slide_paths\n")
     with pytest.raises(ValueError, match="exactly one record"):
         read_single_record(path)
+
+
+# A UTF-8 BOM (the three bytes EF BB BF) at the start of a file is what Excel
+# and some export tools write. Real SEA-AD exports had one. With a plain utf-8
+# read it stays glued to the first column name as an invisible ﻿, so a
+# required field like `study` was falsely reported missing on every row.
+BOM = b"\xef\xbb\xbf"
+
+
+def test_csv_with_utf8_bom_reads_first_column_name_cleanly(tmp_path):
+    path = tmp_path / "bom.csv"
+    path.write_bytes(BOM + b"study,slide_paths\nACT,a.svs\n")
+    records = read_manifest(path)
+    assert records == [{"study": "ACT", "slide_paths": "a.svs"}]
+    assert "﻿study" not in records[0]
+
+
+def test_json_with_utf8_bom_parses(tmp_path):
+    path = tmp_path / "bom.json"
+    path.write_bytes(BOM + b'[{"study": "ACT", "slide_paths": "a.svs"}]')
+    assert read_manifest(path) == [{"study": "ACT", "slide_paths": "a.svs"}]
+
+
+def test_jsonl_with_utf8_bom_parses(tmp_path):
+    path = tmp_path / "bom.jsonl"
+    path.write_bytes(BOM + b'{"study": "ACT", "slide_paths": "a.svs"}\n{"study": "ACT", "slide_paths": "b.svs"}\n')
+    records = read_manifest(path)
+    assert [r["slide_paths"] for r in records] == ["a.svs", "b.svs"]
+    assert "study" in records[0]
+
+
+def test_csv_without_bom_is_unaffected(tmp_path):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"study,slide_paths\nACT,a.svs\n")
+    assert read_manifest(path) == [{"study": "ACT", "slide_paths": "a.svs"}]

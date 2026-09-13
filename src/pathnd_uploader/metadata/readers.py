@@ -36,17 +36,21 @@ def read_manifest(path: Path, *, sheet: str | int | None = None) -> list[dict]:
     multiple sheets (e.g. slide-level vs. case-level data) in one workbook.
     """
     path = Path(path)
+    # utf-8-sig, not utf-8: Excel (and some export tools) prefix text files with a
+    # UTF-8 BOM. Plain utf-8 keeps it, gluing an invisible ﻿ onto the first
+    # column name — so a required field like `study` is falsely reported missing.
+    # Seen on real SEA-AD exports. utf-8-sig strips a BOM if present, no-op otherwise.
     if path.suffix.lower() in (".jsonl", ".ndjson"):
-        with path.open(encoding="utf-8") as f:
+        with path.open(encoding="utf-8-sig") as f:
             return [json.loads(line) for line in f if line.strip()]
     if path.suffix.lower() == ".json":
-        with path.open(encoding="utf-8") as f:
+        with path.open(encoding="utf-8-sig") as f:
             data = json.load(f)
         if not isinstance(data, list):
             raise ValueError(f"{path} must contain a JSON array of per-slide records")
         return data
     if path.suffix.lower() == ".csv":
-        with path.open(newline="", encoding="utf-8") as f:
+        with path.open(newline="", encoding="utf-8-sig") as f:
             return list(csv.DictReader(f))
     if path.suffix.lower() == ".xlsx":
         return _read_xlsx(path, sheet=sheet)
