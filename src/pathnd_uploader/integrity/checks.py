@@ -130,6 +130,10 @@ def check_zero_tail(
     # but on a tiny file a 1 MiB floor is most of the file and a 30%-zeroed tail would slip
     # through. Cap the floor at 10% of the file; irrelevant above ~10 MiB.
     threshold = max(min(min_zero_run_bytes, size * 0.10), size * min_zero_run_fraction)
+    # Only `window_len` bytes are ever read, so a threshold above that could never fire: the
+    # 0.5% fraction exceeds the 64 MiB window on files over ~12.8 GB (a zeroed tail on a 20 GB
+    # slide used to pass). Cap at half the window; legitimate padding is never that large.
+    threshold = min(threshold, window_len // 2)
 
     if zero_run >= threshold:
         at_least = " (at least — the sampled window was entirely zero)" if zero_run == window_len < size else ""

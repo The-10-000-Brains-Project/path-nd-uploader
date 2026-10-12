@@ -122,3 +122,21 @@ def test_zero_tail_catches_a_zeroed_third_of_a_small_file(tmp_path):
 def test_zero_tail_still_tolerates_normal_padding_on_a_small_file(tmp_path):
     data = b"\xab" * 1_900_000 + b"\x00" * 20_000  # ~1%: edge-tile style padding
     assert check_zero_tail(LocalFileSource(_write(tmp_path, "s.svs", data))) is None
+
+
+class _HugeZeroTailSource:
+    """Pretends to be a 20 GB file whose last window is all zero, without allocating it."""
+
+    def size(self):
+        return 20 * 2**30
+
+    def read_range(self, start, length):
+        return bytes(length)
+
+
+def test_zero_tail_fires_on_files_larger_than_window_over_fraction():
+    # Regression: threshold (0.5% of 20 GB = 100 MB) exceeded the 64 MiB sampled window,
+    # so the check could never trigger on files over ~12.8 GB.
+    issue = check_zero_tail(_HugeZeroTailSource())
+    assert issue is not None and issue.check == "zero_tail"
+    assert "at least" in issue.message
