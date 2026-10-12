@@ -33,7 +33,7 @@ from ..integrity import (
     scan_zero_filled_data,
 )
 from ..retry import is_transient, retry_transient
-from ..formats import SUPPORTED_EXTENSIONS, bundle_missing_parts, get_format
+from ..formats import SUPPORTED_EXTENSIONS, _safe_rel, bundle_missing_parts, get_format, vms_references
 
 # Scanning is latency-bound (many small range-reads per object), not bandwidth-bound like
 # uploads, so a much higher default concurrency than batch.py's uploads is safe and valuable —
@@ -64,6 +64,36 @@ class GCSBundleFS:
         return self._bucket.blob(self._dir + rel).download_as_bytes().decode("utf-8-sig", errors="replace")
 
 
+def _download_bundle_parts(blob: storage.Blob, dest: Path, local_stem: str) -> None:
+    """Downloads a bundle's sidecar files next to the already-downloaded index file, so
+    OpenSlide can open it. The index is saved as `<local_stem><ext>`; sidecars are stored
+    under that same stem (MIRAX's data directory) or by their own names (VMS/VMU).
+    """
+    parent = str(Path(blob.name).parent)
+    prefix = "" if parent == "." else f"{parent}/"
+    index_name = Path(blob.name).name
+    ext = Path(index_name).suffix.lower()
+    if ext == ".mrxs":
+        remote_dir = f"{prefix}{Path(index_name).stem}/"
+        names = [(b.name, f"{local_stem}/{b.name[len(remote_dir):]}") for b in blob.bucket.list_blobs(prefix=remote_dir)]
+    else:
+        index_text = (dest / f"{local_stem}{Path(index_name).suffix}").read_text(encoding="utf-8-sig", errors="replace")
+        try:
+            refs = [r for r in vms_references(index_text) if _safe_rel(r)]
+        except Exception:  # noqa: BLE001 - an unparseable index was already reported by the bundle check
+            refs = []
+        names = [(prefix + r.replace("\\", "/"), r.replace("\\", "/")) for r in refs]
+    root = dest.resolve()
+    for remote, rel in names:
+        if rel.endswith("/"):
+            continue
+        target = (dest / rel).resolve()
+        if root not in target.parents:  # object names are untrusted; never write outside the temp dir
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        blob.bucket.blob(remote).download_to_filename(str(target))
+
+
 def audit_object(blob: storage.Blob, *, deep: bool = False) -> IntegrityReport:
     source = GCSBlobSource(blob)
     extension = Path(blob.name).suffix
@@ -89,13 +119,16 @@ def audit_object(blob: storage.Blob, *, deep: bool = False) -> IntegrityReport:
             )
 
     if deep and not any(i.severity == "error" for i in issues):
-        with tempfile.NamedTemporaryFile(suffix=extension) as tmp:
-            blob.download_to_filename(tmp.name)
-            deep_issues, deep_metadata = run_deep_structural_check(Path(tmp.name))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local = Path(tmpdir) / f"slide{extension}"
+            blob.download_to_filename(str(local))
+            if fmt is not None and fmt.bundle:
+                _download_bundle_parts(blob, Path(tmpdir), local.stem)
+            deep_issues, deep_metadata = run_deep_structural_check(local)
             issues += deep_issues
             tech_metadata = {**tech_metadata, **deep_metadata}
             checks_run.append("deep_structural")
-            zero_issues, zero_metadata = scan_zero_filled_data(Path(tmp.name), extension)
+            zero_issues, zero_metadata = scan_zero_filled_data(local, extension)
             issues += zero_issues
             tech_metadata = {**tech_metadata, **zero_metadata}
             checks_run.append("zero_filled_data")

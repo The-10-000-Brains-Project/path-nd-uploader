@@ -191,22 +191,27 @@ _VMS_REFERENCE_SUFFIXES = {".jpg", ".jpeg", ".opt", ".ngr", ".map"}
 _VMS_REF_KEY = re.compile(r"^(ImageFile|MapFile|OptimisationFile|MacroImage|NGRImageFile)", re.IGNORECASE)
 
 
+def vms_references(index_text: str) -> list[str]:
+    """Sibling files a .vms/.vmu index refers to (raw names, as written)."""
+    ini = _parse_ini(index_text)
+    names = []
+    for section in ini.sections():
+        for key, value in ini.items(section):
+            name = value.strip()
+            if _VMS_REF_KEY.match(key) and Path(name.replace("\\", "/")).suffix.lower() in _VMS_REFERENCE_SUFFIXES:
+                names.append(name)
+    return names
+
+
 def _vms_missing(fs: BundleFS, index_name: str) -> list[str]:
     """.vms/.vmu are INI index files referencing sibling image/optimisation
     files by name; any referenced file that's absent makes the slide unreadable.
     """
     try:
-        ini = _parse_ini(fs.read_text(index_name))
+        names = vms_references(fs.read_text(index_name))
     except (configparser.Error, BundleUnreadable) as exc:
         return [f"a readable index file ({exc.__class__.__name__})"]
-    missing = []
-    for section in ini.sections():
-        for key, value in ini.items(section):
-            name = value.strip()
-            if _VMS_REF_KEY.match(key) and Path(name.replace("\\", "/")).suffix.lower() in _VMS_REFERENCE_SUFFIXES:
-                if not _safe_rel(name) or not fs.is_file(name):
-                    missing.append(f"'{name}'")
-    return missing
+    return [f"'{n}'" for n in names if not _safe_rel(n) or not fs.is_file(n)]
 
 
 def bundle_missing_parts(path: Path | str, fs: BundleFS | None = None) -> list[str]:

@@ -228,3 +228,62 @@ def test_audit_deep_runs_zero_fill_scan_on_the_downloaded_copy(tmp_path):
     report = audit_object(blob, deep=True)
     assert "zero_filled_data" in report.checks_run
     assert any(i.check == "zero_filled_data" for i in report.issues), report.issues
+
+
+class _DiskBlob:
+    def __init__(self, bucket, name, data):
+        self.bucket, self.name, self._data = bucket, name, data
+        self.size = len(data)
+
+    def download_to_filename(self, filename):
+        with open(filename, "wb") as fh:
+            fh.write(self._data)
+
+    def download_as_bytes(self, start=None, end=None):
+        return self._data if start is None else self._data[start : end + 1]
+
+    def exists(self):
+        return True
+
+
+class _DiskBucket:
+    name = "test-bucket"
+
+    def __init__(self, objects):
+        self._objects = objects
+
+    def blob(self, name):
+        return _DiskBlob(self, name, self._objects[name])
+
+    def list_blobs(self, prefix="", max_results=None):
+        found = [_DiskBlob(self, n, d) for n, d in sorted(self._objects.items()) if n.startswith(prefix)]
+        return found[:max_results]
+
+
+def _mirax_objects(prefix=""):
+    from pathlib import Path
+
+    root = Path(__file__).parent / "fixtures" / "real"
+    objs = {f"{prefix}s.mrxs": (root / "CMU-1-Saved-1_16.mrxs").read_bytes()}
+    for f in (root / "CMU-1-Saved-1_16").iterdir():
+        objs[f"{prefix}s/{f.name}"] = f.read_bytes()
+    return objs
+
+
+def test_audit_deep_on_real_mirax_bundle_downloads_sidecars_and_passes():
+    # Regression (found on a real bucket): deep mode downloaded only the .mrxs index, so
+    # OpenSlide reported "Unsupported or missing image file" for every good MIRAX slide.
+    objs = _mirax_objects("run/")
+    bucket = _DiskBucket(objs)
+    report = audit_object(_DiskBlob(bucket, "run/s.mrxs", objs["run/s.mrxs"]), deep=True)
+    assert "deep_structural" in report.checks_run
+    assert report.passed, report.issues
+
+
+def test_audit_deep_bundle_download_never_writes_outside_temp_dir(tmp_path):
+    objs = _mirax_objects()
+    objs["s/../../escape.txt"] = b"x"
+    bucket = _DiskBucket(objs)
+    audit_object(_DiskBlob(bucket, "s.mrxs", objs["s.mrxs"]), deep=True)
+    assert not (tmp_path.parent / "escape.txt").exists()
+    assert not (tmp_path / "escape.txt").exists()
