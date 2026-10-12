@@ -186,3 +186,30 @@ def test_lazy_page_errors_that_are_transient_still_propagate(clean_slide_path):
     with patch("tifffile.TiffFile", return_value=fake):
         with pytest.raises(requests.exceptions.ConnectionError):
             check_structural_completeness(LocalFileSource(clean_slide_path), extension=".svs")
+
+
+def test_dimensions_come_from_the_largest_page_not_page_zero(tmp_path):
+    # Regression (found on a real Ventana BIF): page 0 is the small label image. Reporting its
+    # size as the slide's, and judging "implausibly small" by it, would reject good slides.
+    import numpy as np
+    import tifffile
+
+    f = tmp_path / "slide.bif"
+    label = np.zeros((300, 200, 3), dtype="uint8")
+    main = (np.random.default_rng(0).random((1024, 1536, 3)) * 255).astype("uint8")
+    with tifffile.TiffWriter(f) as tif:
+        tif.write(label, photometric="rgb")
+        tif.write(main, tile=(128, 128), photometric="rgb")
+    issues, tech_metadata = check_structural_completeness(LocalFileSource(f), extension=".bif")
+    assert issues == []
+    assert tech_metadata["dimensions"] == (1536, 1024)
+
+
+def test_small_first_page_with_small_everything_is_still_flagged(tmp_path):
+    import numpy as np
+    import tifffile
+
+    f = tmp_path / "tiny.svs"
+    tifffile.imwrite(f, np.zeros((100, 100, 3), dtype="uint8"), photometric="rgb")
+    issues, _ = check_structural_completeness(LocalFileSource(f), extension=".svs")
+    assert any(i.check == "dimensions" for i in issues)

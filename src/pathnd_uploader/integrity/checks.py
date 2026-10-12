@@ -268,6 +268,7 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
             )
             return issues, tech_metadata
 
+        largest = (0, 0, 0)  # (area, width, height)
         with tiff:
             for i, page in enumerate(tiff.pages):
                 if page.is_tiled:
@@ -291,18 +292,24 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
                             )
                         )
 
-                if i == 0 and len(page.shape) >= 2:
-                    height, width = page.shape[0], page.shape[1]
-                    tech_metadata["dimensions"] = (width, height)
-                    if width < 512 or height < 512:
-                        issues.append(
-                            IntegrityIssue(
-                                check="dimensions",
-                                severity="error",
-                                message=f"slide dimensions {(width, height)} are implausibly small for a whole-slide image",
-                            )
-                        )
+                width, height = getattr(page, "imagewidth", 0), getattr(page, "imagelength", 0)
+                if width * height > largest[0]:
+                    largest = (width * height, width, height)
 
+        # The slide's real size is its largest page: page 0 is not always the full-resolution
+        # image (Ventana BIFs lead with the label image, some SCNs with a macro), and judging
+        # "implausibly small" by a label/thumbnail would reject good slides.
+        if largest[0] > 0:
+            _, width, height = largest
+            tech_metadata["dimensions"] = (width, height)
+            if width < 512 or height < 512:
+                issues.append(
+                    IntegrityIssue(
+                        check="dimensions",
+                        severity="error",
+                        message=f"slide dimensions {(width, height)} are implausibly small for a whole-slide image",
+                    )
+                )
     except Exception as exc:
         if is_transient(exc):
             raise
@@ -336,7 +343,8 @@ def run_fast_checks(source: ByteRangeSource, *, extension: str) -> tuple[list[In
 # implement" rather than "damaged file". Matched as substrings of the error text.
 # Ventana scanners (e.g. DP 200) emit joint direction LEFT, which OpenSlide 4.0.x rejects
 # even for pristine files, so reporting it as corruption would be a false alarm.
-_OPENSLIDE_UNSUPPORTED_VARIANT_ERRORS = ("Bad direction attribute",)
+# Leica SCN files with several ROIs at different resolutions are likewise valid but unsupported.
+_OPENSLIDE_UNSUPPORTED_VARIANT_ERRORS = ("Bad direction attribute", "dissimilar main images")
 
 
 def run_deep_structural_check(local_path: Path) -> tuple[list[IntegrityIssue], dict]:

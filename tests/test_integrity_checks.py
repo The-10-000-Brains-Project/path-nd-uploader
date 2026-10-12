@@ -140,3 +140,16 @@ def test_zero_tail_fires_on_files_larger_than_window_over_fraction():
     issue = check_zero_tail(_HugeZeroTailSource())
     assert issue is not None and issue.check == "zero_tail"
     assert "at least" in issue.message
+
+
+def test_leica_multi_roi_openslide_error_is_a_warning(clean_slide_path):
+    from unittest.mock import patch
+
+    import openslide
+
+    from pathnd_uploader.integrity.checks import run_deep_structural_check
+
+    err = openslide.OpenSlideError("Slides with dissimilar main images are not supported")
+    with patch("openslide.OpenSlide", side_effect=err):
+        issues, _ = run_deep_structural_check(clean_slide_path)
+    assert [(i.check, i.severity) for i in issues] == [("structural_open", "warning")]

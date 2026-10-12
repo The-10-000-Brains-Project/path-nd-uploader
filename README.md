@@ -48,9 +48,11 @@ implausibly small dimensions, or any level that can't be read.
   false-positive on good slides.
 - A zeroed or corrupted run in the *middle* of a file passes; only the tail,
   the directory structure and the corner tile of each level are examined.
-- OpenSlide 4.0.x can't open some valid variants (e.g. Ventana scanners
-  that write joint direction `LEFT`). That is reported as a `warning`, not a
-  failure, since the fast checks already passed.
+- OpenSlide 4.0.x can't open some valid variants (Ventana scanners that write
+  joint direction `LEFT`; Leica SCNs with several ROIs at different
+  resolutions). That is reported as a `warning`, not a failure, since the fast
+  checks already passed. For those files the fast checks are the only line of
+  defense.
 - For `.mrxs`/`.vms`/`.vmu` in a bucket audit, sidecar files are looked up by
   object name under the index object's prefix.
 
