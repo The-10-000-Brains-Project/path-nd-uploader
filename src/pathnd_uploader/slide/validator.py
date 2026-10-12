@@ -62,6 +62,13 @@ def validate_slide(
             issues=[IntegrityIssue(check="path_exists", severity="error", message="file does not exist")],
         )
 
+    if not path.is_file():
+        return IntegrityReport(
+            location=str(path),
+            size_bytes=None,
+            issues=[IntegrityIssue(check="path_exists", severity="error", message="path is not a regular file")],
+        )
+
     try:
         validate_extension(path)
     except UnsupportedSlideFormat as exc:
@@ -69,6 +76,16 @@ def validate_slide(
             location=str(path),
             size_bytes=path.stat().st_size,
             issues=[IntegrityIssue(check="extension", severity="error", message=str(exc))],
+        )
+
+    try:
+        with path.open("rb") as fh:
+            fh.read(1)
+    except OSError as exc:
+        return IntegrityReport(
+            location=str(path),
+            size_bytes=path.stat().st_size,
+            issues=[IntegrityIssue(check="readable", severity="error", message=f"file cannot be read: {exc.strerror or exc}")],
         )
 
     stability_issue = _check_file_stability(path, wait_seconds=stability_wait_seconds)

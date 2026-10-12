@@ -113,6 +113,16 @@ def _read_ini(path: Path) -> configparser.ConfigParser:
     return parser
 
 
+def _sibling(base: Path, name: str) -> Path | None:
+    """`base/name` if it is a plain relative path staying inside `base`, else
+    None. Index files are untrusted input: absolute or `..` references must
+    not be probed (or treated as satisfying the bundle).
+    """
+    if not name or Path(name).is_absolute() or ".." in Path(name.replace("\\", "/")).parts:
+        return None
+    return base / name
+
+
 def _mrxs_missing(mrxs_path: Path) -> list[str]:
     data_dir = mrxs_path.with_suffix("")
     if not data_dir.is_dir():
@@ -122,15 +132,22 @@ def _mrxs_missing(mrxs_path: Path) -> list[str]:
         return [f"'{data_dir.name}/Slidedat.ini'"]
     try:
         ini = _read_ini(slidedat)
-    except configparser.Error as exc:
-        return [f"a parseable '{data_dir.name}/Slidedat.ini' ({exc.__class__.__name__})"]
-    if not ini.has_section("DATAFILE"):
-        return []
-    return [
-        f"'{data_dir.name}/{name}'"
-        for key, name in ini.items("DATAFILE")
-        if re.fullmatch(r"FILE_\d+", key) and not (data_dir / name).is_file()
-    ]
+    except (configparser.Error, OSError) as exc:
+        return [f"a readable '{data_dir.name}/Slidedat.ini' ({exc.__class__.__name__})"]
+    entries = [v.strip() for k, v in ini.items("DATAFILE") if re.fullmatch(r"FILE_\d+", k)] if ini.has_section("DATAFILE") else []
+    if not entries:
+        return [f"data file entries in '{data_dir.name}/Slidedat.ini' (no [DATAFILE] FILE_n keys)"]
+    missing = []
+    for name in entries:
+        target = _sibling(data_dir, name)
+        if target is None:
+            missing.append(f"a valid data file reference ({name!r} is empty or escapes the data directory)")
+        elif not target.is_file():
+            missing.append(f"'{data_dir.name}/{name}'")
+    declared = ini.get("DATAFILE", "FILE_COUNT", fallback="").strip()
+    if declared.isdigit() and int(declared) != len(entries):
+        missing.append(f"{int(declared) - len(entries):+d} data file entries (FILE_COUNT={declared}, listed {len(entries)})")
+    return missing
 
 
 _VMS_REFERENCE_SUFFIXES = {".jpg", ".jpeg", ".opt", ".ngr", ".map"}
@@ -143,14 +160,15 @@ def _vms_missing(index_path: Path) -> list[str]:
     """
     try:
         ini = _read_ini(index_path)
-    except configparser.Error as exc:
-        return [f"a parseable index file ({exc.__class__.__name__})"]
+    except (configparser.Error, OSError) as exc:
+        return [f"a readable index file ({exc.__class__.__name__})"]
     missing = []
     for section in ini.sections():
         for key, value in ini.items(section):
             name = value.strip()
             if _VMS_REF_KEY.match(key) and Path(name).suffix.lower() in _VMS_REFERENCE_SUFFIXES:
-                if not (index_path.parent / name).is_file():
+                target = _sibling(index_path.parent, name)
+                if target is None or not target.is_file():
                     missing.append(f"'{name}'")
     return missing
 
