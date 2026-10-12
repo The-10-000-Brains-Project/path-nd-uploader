@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from ..integrity import IntegrityIssue, IntegrityReport, LocalFileSource, run_deep_structural_check, run_fast_checks
+from ..integrity import IntegrityIssue, IntegrityReport, LocalFileSource, run_deep_structural_check, run_fast_checks, scan_zero_filled_data
 from ..formats import UnsupportedSlideFormat, bundle_missing_parts, get_format, validate_extension
 
 DEFAULT_STABILITY_WAIT_SECONDS = 1.0
@@ -125,6 +125,11 @@ def validate_slide(
         issues += deep_issues
         tech_metadata = {**tech_metadata, **deep_metadata}
         checks_run.append("deep_structural")
+
+        zero_issues, zero_metadata = scan_zero_filled_data(path, path.suffix)
+        issues += zero_issues
+        tech_metadata = {**tech_metadata, **zero_metadata}
+        checks_run.append("zero_filled_data")
 
     return IntegrityReport(
         location=str(path),

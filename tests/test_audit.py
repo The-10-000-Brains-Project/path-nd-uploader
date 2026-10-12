@@ -206,3 +206,25 @@ def test_audit_bundle_network_error_is_not_reported_as_a_bad_file():
     except requests.exceptions.ConnectionError:
         pass  # propagates so the retry/inconclusive logic handles it
     assert summary_report is None
+
+
+def test_audit_deep_runs_zero_fill_scan_on_the_downloaded_copy(tmp_path):
+    import numpy as np
+    import tifffile
+
+    img = np.random.default_rng(1).integers(0, 256, (1536, 1536, 3), dtype=np.uint8)
+    src = tmp_path / "src.svs"
+    tifffile.imwrite(src, img, tile=(256, 256), photometric="rgb", compression="zlib")
+    with tifffile.TiffFile(src) as t:
+        p = t.pages[0]
+        lo, hi = min(p.dataoffsets), max(o + c for o, c in zip(p.dataoffsets, p.databytecounts))
+    data = bytearray(src.read_bytes())
+    mid = (lo + hi) // 2 + 1
+    data[mid : mid + 16 * 1024] = bytes(16 * 1024)  # too small for the sampled check to rely on
+    data = bytes(data)
+
+    blob = _mock_blob("s.svs", data)
+    blob.download_to_filename.side_effect = lambda name: open(name, "wb").write(data)
+    report = audit_object(blob, deep=True)
+    assert "zero_filled_data" in report.checks_run
+    assert any(i.check == "zero_filled_data" for i in report.issues), report.issues

@@ -201,6 +201,54 @@ def check_structural_completeness(source: ByteRangeSource, *, extension: str) ->
     return issues, tech_metadata
 
 
+TILE_WINDOW_BYTES = 4096
+MAX_TILE_SAMPLES_PER_PAGE = 24
+MAX_TILE_SAMPLES_TOTAL = 64
+_MIN_JUDGEABLE_TILE_BYTES = 64
+
+
+def _sample_indices(n: int, k: int) -> list[int]:
+    """Up to k indices spread evenly over range(n), always including the first and last."""
+    if n <= k:
+        return list(range(n))
+    if k <= 1:
+        return [n // 2]
+    return sorted({round(j * (n - 1) / (k - 1)) for j in range(k)})
+
+
+def _zero_filled_tile_windows(source: ByteRangeSource, page, offsets, bytecounts, budget: int) -> tuple[int, int]:
+    """Reads a small window from the middle of a spread of tiles/strips on `page` and
+    returns (windows_read, windows_that_were_entirely_zero).
+
+    Complements check_zero_tail for zero-filled runs that are NOT at the end of the file
+    (a bad copy block, a dropped chunk): a compressed tile that is entirely zero in its
+    middle is never valid data, so this needs no size threshold. Uncompressed pages are
+    skipped — a black region legitimately encodes as zeros there.
+    """
+    if int(page.compression) == 1:
+        return 0, 0
+    offs, counts = list(offsets), list(bytecounts)
+    read = zero = 0
+    cap = min(MAX_TILE_SAMPLES_PER_PAGE, budget)
+    for idx in _sample_indices(len(offs), cap):
+        off, count = int(offs[idx]), int(counts[idx])
+        if count < _MIN_JUDGEABLE_TILE_BYTES or off + count > source.size():
+            continue
+        # NDPI (and some strip layouts) store a page as one multi-GB blob, so a single window
+        # would say almost nothing about it; spread several along any large tile/strip.
+        fractions = (0.2, 0.4, 0.6, 0.8) if count > 16 * TILE_WINDOW_BYTES else (0.5,)
+        length = min(count, TILE_WINDOW_BYTES)
+        for frac in fractions:
+            if read >= cap:
+                return read, zero
+            start = off + min(max(int(count * frac) - length // 2, 0), count - length)
+            window = source.read_range(start, length)
+            read += 1
+            if window and not any(window):
+                zero += 1
+    return read, zero
+
+
 def _open_tiff(source: ByteRangeSource, extension: str):
     """Opens `source` with tifffile, naming it after the extension so tifffile picks
     the right parsing mode (see RangeReadFile). A real .ndpi is NDPI-format, but a
@@ -269,17 +317,31 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
             return issues, tech_metadata
 
         largest = (0, 0, 0)  # (area, width, height)
+        windows_read = windows_zero = 0
+        zeroed_pages: list[int] = []
+        sampled_pages: list[tuple] = []
         with tiff:
             for i, page in enumerate(tiff.pages):
-                if page.is_tiled:
-                    offsets = page.tags.get("TileOffsets")
-                    bytecounts = page.tags.get("TileByteCounts")
-                else:
-                    offsets = page.tags.get("StripOffsets")
-                    bytecounts = page.tags.get("StripByteCounts")
+                # dataoffsets/databytecounts abstract over tile vs. strip layouts. Looking up
+                # "TileOffsets" by name misses NDPI, which tifffile reports as tiled while the
+                # file stores strip tags — the data-fits-in-file check was silently skipped there.
+                offsets, bytecounts = page.dataoffsets, page.databytecounts
 
-                if offsets is not None and bytecounts is not None:
-                    claimed_end = max((o + c for o, c in zip(offsets.value, bytecounts.value)), default=0)
+                # A page with no tags / no image data / no size is an IFD that was zero-filled
+                # (a zeroed directory parses as an empty one rather than raising), which would
+                # otherwise just look like a pyramid with fewer levels.
+                if not offsets or not bytecounts or not getattr(page, "imagewidth", 0) or not getattr(page, "imagelength", 0):
+                    issues.append(
+                        IntegrityIssue(
+                            check="structural_completeness",
+                            severity="error",
+                            message=f"page {i} has no image data or zero dimensions — its directory entry is empty or zero-filled",
+                        )
+                    )
+                    continue
+
+                if offsets and bytecounts:
+                    claimed_end = max((o + c for o, c in zip(offsets, bytecounts)), default=0)
                     if claimed_end > file_size:
                         issues.append(
                             IntegrityIssue(
@@ -292,9 +354,38 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
                             )
                         )
 
+                if offsets and bytecounts and int(page.compression) != 1:
+                    sampled_pages.append((i, page, offsets, bytecounts, sum(bytecounts)))
+
                 width, height = getattr(page, "imagewidth", 0), getattr(page, "imagelength", 0)
                 if width * height > largest[0]:
                     largest = (width * height, width, height)
+
+        # Spread the sampling budget over pages in proportion to their data (the full-resolution
+        # page holds nearly all the bytes, so it should get nearly all the windows), with at
+        # least one window per page so thumbnails/labels are still looked at.
+        total_bytes = sum(sp[4] for sp in sampled_pages) or 1
+        for i, page, offsets, bytecounts, nbytes in sampled_pages:
+            share = max(1, round(MAX_TILE_SAMPLES_TOTAL * nbytes / total_bytes))
+            read, zero = _zero_filled_tile_windows(
+                source, page, offsets, bytecounts, min(share, MAX_TILE_SAMPLES_PER_PAGE)
+            )
+            windows_read += read
+            windows_zero += zero
+            if zero:
+                zeroed_pages.append(i)
+        tech_metadata["tile_windows_sampled"] = windows_read
+        if windows_zero:
+            issues.append(
+                IntegrityIssue(
+                    check="zero_filled_tiles",
+                    severity="error",
+                    message=(
+                        f"{windows_zero} of {windows_read} sampled tile windows (pages {zeroed_pages}) are entirely "
+                        "zero — compressed image data is never all zeros, so a region of the file was zero-filled"
+                    ),
+                )
+            )
 
         # The slide's real size is its largest page: page 0 is not always the full-resolution
         # image (Ventana BIFs lead with the label image, some SCNs with a macro), and judging
@@ -345,6 +436,103 @@ def run_fast_checks(source: ByteRangeSource, *, extension: str) -> tuple[list[In
 # even for pristine files, so reporting it as corruption would be a false alarm.
 # Leica SCN files with several ROIs at different resolutions are likewise valid but unsupported.
 _OPENSLIDE_UNSUPPORTED_VARIANT_ERRORS = ("Bad direction attribute", "dissimilar main images")
+
+
+ZERO_BLOCK_BYTES = 4096
+_ZERO_SCAN_CHUNK_BLOCKS = 8192  # 32 MiB per read
+
+
+def scan_zero_filled_data(local_path: Path, extension: str) -> tuple[list[IntegrityIssue], dict]:
+    """Streams through every byte of compressed tile/strip data in a local TIFF-based
+    slide and flags runs of zero-filled 4 KiB blocks. Unlike the sampled tile-window check
+    (which can run over the network but only sees a fraction of the file), this is
+    exhaustive — a zeroed region anywhere inside image data is found — at the cost of
+    reading the whole file, so it belongs with the other local-only deep checks.
+
+    Two or more adjacent all-zero blocks inside compressed data is never legitimate:
+    JPEG/JPEG2000/LZW/deflate output has no 8 KiB runs of zeros. Uncompressed pages and
+    the gaps between tiles (padding, directories) are excluded from the scan.
+    """
+    if extension.lower() not in TIFF_BASED_EXTENSIONS:
+        return [], {}
+
+    import numpy as np
+    import tifffile
+
+    # Open by real path (not the range-read wrapper): NDPI/BigTIFF handling then comes from the file itself.
+    try:
+        with tifffile.TiffFile(str(local_path)) as tiff:
+            spans = []
+            for page in tiff.pages:
+                if int(page.compression) == 1:
+                    continue
+                spans.extend(zip(page.dataoffsets, page.databytecounts))
+    except Exception:  # an unparseable file is reported by the structural check, not here
+        return [], {}
+
+    # Merge touching/overlapping tile ranges so we read each byte once.
+    merged: list[list[int]] = []
+    for start, count in sorted((int(o), int(c)) for o, c in spans if c):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], start + count)
+        else:
+            merged.append([start, start + count])
+
+    block = ZERO_BLOCK_BYTES
+    runs: list[tuple[int, int]] = []  # (offset, length_in_blocks)
+    scanned = 0
+    with open(local_path, "rb") as fh:
+        for lo, hi in merged:
+            first = -(-lo // block) * block  # first block fully inside the range
+            last = hi // block * block
+            pos, run_start, run_len = first, None, 0
+            while pos < last:
+                n = min(_ZERO_SCAN_CHUNK_BLOCKS, (last - pos) // block)
+                fh.seek(pos)
+                data = fh.read(n * block)
+                n = len(data) // block
+                if n == 0:
+                    break
+                arr = np.frombuffer(data, dtype=np.uint8, count=n * block).reshape(n, block)
+                is_zero = ~arr.any(axis=1)
+                scanned += n
+                # collapse the boolean vector into (start, length) runs of zero blocks
+                edges = np.flatnonzero(np.diff(np.concatenate(([False], is_zero, [False])).astype(np.int8)))
+                for a, b in zip(edges[::2], edges[1::2]):
+                    off = pos + int(a) * block
+                    if run_start is not None and run_start + run_len * block == off:
+                        run_len += int(b - a)
+                    else:
+                        if run_start is not None and run_len >= 2:
+                            runs.append((run_start, run_len))
+                        run_start, run_len = off, int(b - a)
+                pos += n * block
+                if run_start is not None and run_start + run_len * block != pos:
+                    if run_len >= 2:
+                        runs.append((run_start, run_len))
+                    run_start, run_len = None, 0
+            if run_start is not None and run_len >= 2:
+                runs.append((run_start, run_len))
+
+    metadata = {"zero_scan_bytes": scanned * block}
+    if not runs:
+        return [], metadata
+    total = sum(r[1] for r in runs) * block
+    first_off, first_len = runs[0]
+    return (
+        [
+            IntegrityIssue(
+                check="zero_filled_data",
+                severity="error",
+                message=(
+                    f"{len(runs)} zero-filled region(s) ({total:,} bytes in all) inside compressed image data — "
+                    f"first at byte {first_off:,} ({first_len * block:,} bytes); part of the file was zero-filled "
+                    "(compressed image data is never all zeros)"
+                ),
+            )
+        ],
+        metadata,
+    )
 
 
 def run_deep_structural_check(local_path: Path) -> tuple[list[IntegrityIssue], dict]:
@@ -416,19 +604,22 @@ def run_deep_structural_check(local_path: Path) -> tuple[list[IntegrityIssue], d
         for level in range(slide.level_count):
             try:
                 lw, lh = slide.level_dimensions[level]
-                # Spot-check a small region near the bottom-right corner of each
-                # level — the area most likely to be missing if the file was
-                # truncated partway through being written.
+                # Read a small region at the corners, edges and centre of each level. The
+                # bottom-right corner is the first thing missing in a truncated write, but a
+                # damaged chunk elsewhere in the file only shows up if we look there too.
                 sample_size = 64
-                x = max(lw - sample_size, 0)
-                y = max(lh - sample_size, 0)
-                slide.read_region((x, y), level, (min(sample_size, lw), min(sample_size, lh)))
+                w, h = min(sample_size, lw), min(sample_size, lh)
+                xs = sorted({0, max((lw - w) // 2, 0), max(lw - w, 0)})
+                ys = sorted({0, max((lh - h) // 2, 0), max(lh - h, 0)})
+                for y in ys:
+                    for x in xs:
+                        slide.read_region((x, y), level, (w, h))
             except openslide.OpenSlideError as exc:
                 issues.append(
                     IntegrityIssue(
                         check="level_read",
                         severity="error",
-                        message=f"level {level} could not be read (likely truncated): {exc}",
+                        message=f"level {level} could not be read (likely truncated or damaged): {exc}",
                     )
                 )
 

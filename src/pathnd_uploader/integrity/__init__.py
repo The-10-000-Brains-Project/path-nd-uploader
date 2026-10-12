@@ -5,6 +5,7 @@ from .checks import (
     check_zero_tail,
     run_deep_structural_check,
     run_fast_checks,
+    scan_zero_filled_data,
 )
 from .models import IntegrityIssue, IntegrityReport
 
@@ -20,4 +21,5 @@ __all__ = [
     "check_zero_tail",
     "run_fast_checks",
     "run_deep_structural_check",
+    "scan_zero_filled_data",
 ]

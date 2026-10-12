@@ -24,7 +24,14 @@ from typing import Callable, Iterator
 
 from google.cloud import storage
 
-from ..integrity import GCSBlobSource, IntegrityIssue, IntegrityReport, run_deep_structural_check, run_fast_checks
+from ..integrity import (
+    GCSBlobSource,
+    IntegrityIssue,
+    IntegrityReport,
+    run_deep_structural_check,
+    run_fast_checks,
+    scan_zero_filled_data,
+)
 from ..retry import is_transient, retry_transient
 from ..formats import SUPPORTED_EXTENSIONS, bundle_missing_parts, get_format
 
@@ -88,6 +95,10 @@ def audit_object(blob: storage.Blob, *, deep: bool = False) -> IntegrityReport:
             issues += deep_issues
             tech_metadata = {**tech_metadata, **deep_metadata}
             checks_run.append("deep_structural")
+            zero_issues, zero_metadata = scan_zero_filled_data(Path(tmp.name), extension)
+            issues += zero_issues
+            tech_metadata = {**tech_metadata, **zero_metadata}
+            checks_run.append("zero_filled_data")
 
     return IntegrityReport(
         location=source.describe(),

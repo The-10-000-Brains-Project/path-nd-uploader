@@ -57,16 +57,15 @@ def test_catches_plain_truncation_that_zero_tail_would_miss(bare_truncated_slide
     assert all(i.severity == "error" for i in issues)
 
 
-def test_zero_padded_truncation_at_original_size_is_not_this_checks_job(truncated_slide_path):
-    # Important distinction: truncated_slide_path keeps the file at its
-    # ORIGINAL total size (the tail is zero-filled, not removed), so every
-    # tile's claimed byte range still fits — this check has no way to know
-    # those bytes were overwritten with zeros rather than real data. That
-    # failure mode is exactly what check_zero_tail exists for; the two
-    # checks are complementary, not redundant, and this documents why both
-    # are needed rather than either superseding the other.
+def test_zero_padded_truncation_is_only_seen_structurally_via_zeroed_directories(truncated_slide_path):
+    # truncated_slide_path keeps the file at its ORIGINAL size (tail zero-filled, not removed), so
+    # every tile's claimed byte range still fits: the "data fits in the file" test can't see it,
+    # and the zero-tail heuristic (check_zero_tail) is what reliably catches this. The structural
+    # check only notices when the zeroing happens to wipe out page directories, and then only as
+    # "empty page" errors. Both checks stay needed; neither supersedes the other.
     issues, _ = check_structural_completeness(LocalFileSource(truncated_slide_path), extension=".svs")
-    assert issues == []
+    assert not any("truncated" in i.message for i in issues)
+    assert all("empty or zero-filled" in i.message or "page directory" in i.message for i in issues), issues
 
 
 def test_non_tiff_extension_is_skipped(tmp_path):
@@ -213,3 +212,37 @@ def test_small_first_page_with_small_everything_is_still_flagged(tmp_path):
     tifffile.imwrite(f, np.zeros((100, 100, 3), dtype="uint8"), photometric="rgb")
     issues, _ = check_structural_completeness(LocalFileSource(f), extension=".svs")
     assert any(i.check == "dimensions" for i in issues)
+
+
+def test_sample_indices_edge_cases():
+    from pathnd_uploader.integrity.checks import _sample_indices
+
+    assert _sample_indices(1, 1) == [0]
+    assert _sample_indices(100, 1) == [50]  # budget share of 1 used to divide by zero
+    assert _sample_indices(100, 0) == [50]
+    assert _sample_indices(3, 10) == [0, 1, 2]
+    picks = _sample_indices(1000, 6)
+    assert picks[0] == 0 and picks[-1] == 999 and len(picks) == 6
+
+
+def test_zero_filled_ifd_is_reported_not_silently_dropped(tmp_path):
+    # Regression (found by zeroing mid-file regions of real Ventana/Leica slides): a zeroed
+    # IFD parses as an empty page instead of raising, so the pyramid just looked shorter.
+    import numpy as np
+    import tifffile
+
+    f = tmp_path / "s.svs"
+    arr = (np.random.default_rng(0).random((1024, 1024, 3)) * 255).astype("uint8")
+    with tifffile.TiffWriter(f) as tif:
+        tif.write(arr, tile=(128, 128), photometric="rgb")
+        tif.write(arr[::2, ::2], photometric="rgb", subfiletype=1)
+        tif.write(arr[::4, ::4], photometric="rgb", subfiletype=1)
+    with tifffile.TiffFile(f) as t:
+        ifd = t.pages[1].offset
+        n_tags = len(t.pages[1].tags)
+    data = bytearray(f.read_bytes())
+    # zero the middle page's tag table but leave its "next IFD" pointer chain reachable via page 0
+    data[ifd + 2 : ifd + 2 + n_tags * 12] = bytes(n_tags * 12)
+    f.write_bytes(bytes(data))
+    issues, _ = check_structural_completeness(LocalFileSource(f), extension=".svs")
+    assert any("page 1" in i.message or "directory" in i.message for i in issues), issues

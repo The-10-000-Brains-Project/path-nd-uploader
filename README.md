@@ -17,6 +17,13 @@ check is opt-in** (`--deep`) and needs the whole file on local disk.
 
 **Fast checks (default):**
 
+Besides the table below, the structural check also reports a page whose
+directory entry is empty or zero-filled (which otherwise parses as a shorter
+pyramid), and samples about 64 small windows of tile data, weighted by page size,
+failing if any compressed tile window is entirely zero. Sampling is cheap enough
+for bucket audits (about +50 range reads per object) but only sees a fraction of
+the file, so a small zeroed chunk can slip through; `--deep` is exhaustive.
+
 | Check | What it confirms | Fails when |
 |---|---|---|
 | **TIFF header** | The file starts with a valid TIFF magic number (classic or BigTIFF, either byte order). TIFF-based formats (`.svs .ndpi .scn .bif .tif .tiff`); `.svslide` is checked for its SQLite header instead. | The file is under 4 bytes, or the first bytes aren't a TIFF magic number. |
@@ -36,18 +43,28 @@ explicit "recognized but not yet supported" error rather than half-validated.
 
 **Deep check (`--deep`, local files only, needs OpenSlide):**
 
-Opens the slide with OpenSlide, walks every pyramid level, and reads a small
-region at the far corner of each level — the part that goes missing first if
-a write was cut off. Fails on an open error, zero pyramid levels,
-implausibly small dimensions, or any level that can't be read.
+Opens the slide with OpenSlide, walks every pyramid level, and reads small
+regions at the corners, edges and centre of each level. Fails on an open
+error, zero pyramid levels, implausibly small dimensions, or any level that
+can't be read.
+
+It then streams through **all compressed tile data** (TIFF-based formats) looking
+for zero-filled regions: two or more adjacent all-zero 4 KiB blocks inside
+compressed image data is never valid (JPEG/JPEG 2000/LZW output has no such
+runs), so any zeroed chunk anywhere in the image data is found, down to
+~12 KiB. Reads the whole file (about 3 s for a 7 GB slide on a local SSD).
+Uncompressed pages and the gaps between tiles are excluded.
 
 **Known limits:**
 - MIRAX tile data (`Data*.dat`) is checked for presence only. A truncated or
   zero-filled data file is not detected, since pristine MIRAX data files
   legitimately end in long zero runs, so a zero-tail heuristic would
   false-positive on good slides.
-- A zeroed or corrupted run in the *middle* of a file passes; only the tail,
-  the directory structure and the corner tile of each level are examined.
+- Zero-filled regions are detected, but other corruption of tile *content*
+  (flipped bits, garbage that isn't zero) is only caught if it breaks the
+  directory structure or an OpenSlide read; the tool doesn't decode every tile.
+- Without `--deep`, a zeroed run in the middle of a file is found only if one of
+  the ~64 sampled tile windows lands in it (larger runs are likelier to be hit).
 - OpenSlide 4.0.x can't open some valid variants (Ventana scanners that write
   joint direction `LEFT`; Leica SCNs with several ROIs at different
   resolutions). That is reported as a `warning`, not a failure, since the fast
