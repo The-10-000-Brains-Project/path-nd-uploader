@@ -26,7 +26,7 @@ from google.cloud import storage
 
 from ..integrity import GCSBlobSource, IntegrityIssue, IntegrityReport, run_deep_structural_check, run_fast_checks
 from ..retry import is_transient, retry_transient
-from ..slide.formats import SUPPORTED_EXTENSIONS
+from ..formats import SUPPORTED_EXTENSIONS
 
 # Scanning is latency-bound (many small range-reads per object), not bandwidth-bound like
 # uploads, so a much higher default concurrency than batch.py's uploads is safe and valuable —

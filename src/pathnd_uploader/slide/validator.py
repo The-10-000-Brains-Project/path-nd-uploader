@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from ..integrity import IntegrityIssue, IntegrityReport, LocalFileSource, run_deep_structural_check, run_fast_checks
-from .formats import UnsupportedSlideFormat, validate_extension
+from ..formats import UnsupportedSlideFormat, bundle_missing_parts, validate_extension
 
 DEFAULT_STABILITY_WAIT_SECONDS = 1.0
 
@@ -80,6 +80,22 @@ def validate_slide(
             issues=[stability_issue],
         )
     checks_run.append("file_stability")
+
+    missing_parts = bundle_missing_parts(path)
+    if missing_parts:
+        return IntegrityReport(
+            location=str(path),
+            size_bytes=path.stat().st_size,
+            checks_run=checks_run + ["bundle_completeness"],
+            issues=[
+                IntegrityIssue(
+                    check="bundle_completeness",
+                    severity="error",
+                    message=f"multi-file slide is missing: {', '.join(missing_parts)}",
+                )
+            ],
+        )
+    checks_run.append("bundle_completeness")
 
     source = LocalFileSource(path)
     issues, tech_metadata = run_fast_checks(source, extension=path.suffix)

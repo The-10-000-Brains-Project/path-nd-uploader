@@ -28,7 +28,7 @@ from .metadata import ValidationResult, resolve_slide_path, validate_metadata
 from .reconcile import ReconciliationResult, check_slide_path_exists, reconcile
 from .schema import Schema, load_schema
 from .slide import validate_slide
-from .slide.formats import SUPPORTED_EXTENSIONS
+from .formats import SUPPORTED_EXTENSIONS
 from .slide.validator import DEFAULT_STABILITY_WAIT_SECONDS
 
 DEFAULT_WORKERS = 6

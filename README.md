@@ -19,13 +19,20 @@ check is opt-in** (`--deep`) and needs the whole file on local disk.
 
 | Check | What it confirms | Fails when |
 |---|---|---|
-| **TIFF header** | The file starts with a valid TIFF magic number (classic or BigTIFF, either byte order). TIFF-based formats only (`.svs .tif .tiff .ndpi .scn`). | The file is under 4 bytes, or the first bytes aren't a TIFF magic number. |
+| **TIFF header** | The file starts with a valid TIFF magic number (classic or BigTIFF, either byte order). TIFF-based formats (`.svs .ndpi .scn .bif .tif .tiff`); `.svslide` is checked for its SQLite header instead. | The file is under 4 bytes, or the first bytes aren't a TIFF magic number. |
 | **Zero-tail** | The end of the file isn't a long run of zero bytes. Reads the last 64 MiB and measures the actual trailing zero run. | The trailing zero run is larger than `max(1 MiB, 0.5% of file size)`, or the file is 0 bytes. This is the signature of an interrupted upload — including a file that was zero-padded back to its original length, which passes a size check but fails here. |
 | **Structural completeness** | Every TIFF page's tile/strip data fits inside the file's actual size. Parses the TIFF directory over range reads, never the whole file. TIFF-based formats only. | A page claims bytes past the end of the file (physically short / cut-off copy), the directory can't be parsed, there are no readable pages, or the first page is smaller than 512×512. |
 
-Supported non-TIFF formats (`.mrxs`, `.vms`, `.vmu`, `.bif`) get the
-zero-tail check only; the header and structural checks are TIFF-specific and
-skipped.
+Other supported formats (`.mrxs`, `.vms`, `.vmu`) get the zero-tail check
+only; the header and structural checks don't apply to them. Those multi-file
+formats also get a **bundle completeness** check on local files: `.mrxs`
+needs its sibling data directory, `Slidedat.ini`, and every `Data*.dat` it
+lists; `.vms`/`.vmu` need every image/optimisation file their index
+references.
+
+Supported formats are the ones OpenSlide can open. Known pathology formats it
+can't (`.czi`, `.vsi`, `.qptiff`, `.isyntax`, `.dcm`, ...) are rejected with an
+explicit "recognized but not yet supported" error rather than half-validated.
 
 **Deep check (`--deep`, local files only, needs OpenSlide):**
 

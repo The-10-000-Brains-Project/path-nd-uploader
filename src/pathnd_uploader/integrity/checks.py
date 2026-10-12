@@ -24,18 +24,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..retry import is_transient
+from ..formats import TIFF_BASED_EXTENSIONS, get_format
 from .byte_source import ByteRangeSource, RangeReadFile
 from .models import IntegrityIssue
 
-# Extensions known to be TIFF-based, where a TIFF magic-number check is meaningful.
-# .mrxs (MIRAX) and .czi (Zeiss) are proprietary container formats, not TIFF.
-_TIFF_MAGIC_BYTES = {
-    b"II*\x00",  # little-endian classic TIFF
-    b"MM\x00*",  # big-endian classic TIFF
-    b"II+\x00",  # little-endian BigTIFF
-    b"MM\x00+",  # big-endian BigTIFF
-}
-TIFF_BASED_EXTENSIONS = {".svs", ".tif", ".tiff", ".ndpi", ".scn"}
+# Header-magic and TIFF-structure applicability comes from the slide format registry.
 
 DEFAULT_SAMPLE_WINDOW_BYTES = 64 * 1024 * 1024  # 64 MiB: how much of the tail we read
 # A legitimate pyramid's smallest level is often not an exact multiple of the tile size, so
@@ -47,22 +40,26 @@ DEFAULT_MIN_ZERO_RUN_FRACTION = 0.005  # 0.5% of file size
 
 
 def check_header_magic(source: ByteRangeSource, *, extension: str) -> IntegrityIssue | None:
-    """Confirms the file starts with a valid TIFF magic number, when applicable."""
-    if extension.lower() not in TIFF_BASED_EXTENSIONS:
+    """Confirms the file starts with the format's magic number (TIFF or
+    BigTIFF for TIFF-based formats, SQLite for .svslide), when it has one."""
+    fmt = get_format(extension)
+    if fmt is None or fmt.magics is None:
         return None
     size = source.size()
-    if size < 4:
+    longest = max(len(m) for m in fmt.magics)
+    if size < longest:
         return IntegrityIssue(
             check="header_magic",
             severity="error",
-            message=f"file is only {size} bytes, too small to contain a TIFF header",
+            message=f"file is only {size} bytes, too small to contain a {fmt.name} header",
         )
-    header = source.read_range(0, 4)
-    if header not in _TIFF_MAGIC_BYTES:
+    header = source.read_range(0, longest)
+    if not any(header.startswith(m) for m in fmt.magics):
+        label = "TIFF magic number" if fmt.tiff_based else f"{fmt.name} header"
         return IntegrityIssue(
             check="header_magic",
             severity="error",
-            message=f"file does not start with a recognized TIFF magic number (got {header!r})",
+            message=f"file does not start with a recognized {label} (got {header[:4]!r})",
         )
     return None
 
