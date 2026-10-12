@@ -98,3 +98,27 @@ def test_implausibly_small_dimensions_are_flagged(tmp_path):
     issues, tech_metadata = check_structural_completeness(LocalFileSource(f), extension=".svs")
     assert any(i.check == "dimensions" for i in issues)
     assert tech_metadata["dimensions"] == (64, 64)
+
+
+def test_truncation_that_cuts_only_the_page_chain_is_caught(tmp_path):
+    # Regression (found on a real Aperio .svs): layout is IFD0, level-0 tile data, then
+    # IFD1... A cut after level-0's data leaves page 0 fully valid, and tifffile only *logs*
+    # that the next-IFD pointer is past EOF — it returns one good-looking page.
+    import numpy as np
+    import tifffile
+
+    full = tmp_path / "full.svs"
+    arr = (np.random.default_rng(0).random((512, 512, 3)) * 255).astype("uint8")
+    with tifffile.TiffWriter(full) as tif:
+        tif.write(arr, tile=(128, 128), photometric="rgb")
+        tif.write(arr[::2, ::2], photometric="rgb", subfiletype=1)
+        tif.write(arr[::4, ::4], photometric="rgb", subfiletype=1)
+    with tifffile.TiffFile(full) as t:
+        p0 = t.pages[0]
+        page0_end = max(o + c for o, c in zip(p0.dataoffsets, p0.databytecounts))
+    cut = tmp_path / "cut.svs"
+    cut.write_bytes(full.read_bytes()[:page0_end])
+
+    issues, _ = check_structural_completeness(LocalFileSource(cut), extension=".svs")
+    assert any("page directory chain" in i.message and "truncated" in i.message for i in issues), issues
+    assert check_structural_completeness(LocalFileSource(full), extension=".svs")[0] == []

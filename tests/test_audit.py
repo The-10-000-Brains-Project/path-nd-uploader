@@ -129,3 +129,80 @@ def test_audit_manifest_against_bucket_finds_missing_files():
     missing = audit_manifest_against_bucket(records, bucket_name="b", client=client)
 
     assert missing == ["missing.svs"]
+
+
+class _FakeBucket:
+    """In-memory bucket supporting blob().exists()/download_as_bytes() and list_blobs(prefix=)."""
+
+    def __init__(self, objects: dict[str, bytes]):
+        self.name = "test-bucket"
+        self._objects = objects
+
+    def blob(self, name):
+        b = MagicMock()
+        b.exists.side_effect = lambda: name in self._objects
+        b.download_as_bytes.side_effect = lambda: self._objects[name]
+        return b
+
+    def list_blobs(self, prefix="", max_results=None):
+        found = [n for n in self._objects if n.startswith(prefix)]
+        return [MagicMock(name=n) for n in found[:max_results]]
+
+
+def _bundle_blob(name, objects):
+    blob = _mock_blob(name, objects[name])
+    blob.bucket = _FakeBucket(objects)
+    return blob
+
+
+_SLIDEDAT = b"[DATAFILE]\nFILE_COUNT=2\nFILE_0=Data0000.dat\nFILE_1=Data0001.dat\n"
+_INDEX = b"\x01" * 4096
+
+
+def test_audit_mrxs_complete_bundle_passes():
+    objs = {
+        "run/s.mrxs": _INDEX,
+        "run/s/Slidedat.ini": _SLIDEDAT,
+        "run/s/Data0000.dat": b"d",
+        "run/s/Data0001.dat": b"d",
+        "run/s/Index.dat": b"i",
+    }
+    report = audit_object(_bundle_blob("run/s.mrxs", objs))
+    assert report.passed, report.issues
+    assert "bundle_completeness" in report.checks_run
+
+
+def test_audit_mrxs_missing_data_file_is_flagged():
+    objs = {
+        "run/s.mrxs": _INDEX,
+        "run/s/Slidedat.ini": _SLIDEDAT,
+        "run/s/Data0000.dat": b"d",
+        "run/s/Index.dat": b"i",
+    }
+    report = audit_object(_bundle_blob("run/s.mrxs", objs))
+    assert [i.check for i in report.issues] == ["bundle_completeness"]
+    assert "Data0001.dat" in report.issues[0].message
+
+
+def test_audit_mrxs_missing_data_directory_at_bucket_root():
+    report = audit_object(_bundle_blob("s.mrxs", {"s.mrxs": _INDEX}))
+    assert "data directory" in report.issues[0].message
+
+
+def test_audit_vms_missing_sibling_is_flagged():
+    objs = {"s.vms": b"[X]\nImageFile(0,0)=a.jpg\nMapFile=m.jpg\n" + b" " * 3000, "a.jpg": b"j"}
+    report = audit_object(_bundle_blob("s.vms", objs))
+    assert "m.jpg" in report.issues[0].message and "a.jpg" not in report.issues[0].message
+
+
+def test_audit_bundle_network_error_is_not_reported_as_a_bad_file():
+    import requests
+
+    blob = _bundle_blob("s.mrxs", {"s.mrxs": _INDEX, "s/Slidedat.ini": _SLIDEDAT})
+    blob.bucket.blob = MagicMock(side_effect=requests.exceptions.ConnectionError("reset"))
+    summary_report = None
+    try:
+        summary_report = audit_object(blob)
+    except requests.exceptions.ConnectionError:
+        pass  # propagates so the retry/inconclusive logic handles it
+    assert summary_report is None

@@ -86,3 +86,39 @@ def test_run_fast_checks_aggregates_issues_from_all_three_checks(bare_truncated_
     source = LocalFileSource(bare_truncated_slide_path)
     issues, _ = run_fast_checks(source, extension=".svs")
     assert any(i.check == "structural_completeness" for i in issues)
+
+
+def test_openslide_unsupported_variant_is_a_warning_not_corruption(clean_slide_path):
+    from unittest.mock import patch
+
+    import openslide
+
+    from pathnd_uploader.integrity.checks import run_deep_structural_check
+
+    with patch("openslide.OpenSlide", side_effect=openslide.OpenSlideError('Bad direction attribute "LEFT"')):
+        issues, _ = run_deep_structural_check(clean_slide_path)
+    assert [(i.check, i.severity) for i in issues] == [("structural_open", "warning")]
+
+
+def test_other_openslide_open_errors_remain_errors(clean_slide_path):
+    from unittest.mock import patch
+
+    import openslide
+
+    from pathnd_uploader.integrity.checks import run_deep_structural_check
+
+    with patch("openslide.OpenSlide", side_effect=openslide.OpenSlideError("Unsupported or missing image file")):
+        issues, _ = run_deep_structural_check(clean_slide_path)
+    assert [(i.check, i.severity) for i in issues] == [("structural_open", "error")]
+
+
+def test_zero_tail_catches_a_zeroed_third_of_a_small_file(tmp_path):
+    # Regression: the 1 MiB absolute floor used to exceed 30% of a ~1.9 MB real slide, so a
+    # 30%-zeroed tail passed. The floor is now capped at 10% of file size.
+    data = b"\xab" * 1_400_000 + b"\x00" * 580_000
+    assert check_zero_tail(LocalFileSource(_write(tmp_path, "s.svs", data))) is not None
+
+
+def test_zero_tail_still_tolerates_normal_padding_on_a_small_file(tmp_path):
+    data = b"\xab" * 1_900_000 + b"\x00" * 20_000  # ~1%: edge-tile style padding
+    assert check_zero_tail(LocalFileSource(_write(tmp_path, "s.svs", data))) is None

@@ -21,12 +21,47 @@ Two tiers, deliberately kept separate:
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import re
+import threading
 from pathlib import Path
 
 from ..retry import is_transient
 from ..formats import TIFF_BASED_EXTENSIONS, get_format
 from .byte_source import ByteRangeSource, RangeReadFile
 from .models import IntegrityIssue
+
+
+class _TifffileWarningCapture(logging.Handler):
+    """tifffile doesn't raise when the IFD chain points somewhere invalid (e.g.
+    past EOF in a truncated file) — it logs a warning and silently returns the
+    pages it did manage to read. That warning is the only signal, so capture it
+    per-thread (audits run many files concurrently) instead of letting it go to
+    stderr, where it's just noise.
+    """
+
+    _local = threading.local()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        sink = getattr(self._local, "sink", None)
+        if sink is not None:
+            sink.append(record.getMessage())
+
+    @classmethod
+    @contextlib.contextmanager
+    def capture(cls):
+        sink: list[str] = []
+        cls._local.sink = sink
+        try:
+            yield sink
+        finally:
+            cls._local.sink = None
+
+
+_tifffile_logger = logging.getLogger("tifffile")
+_tifffile_logger.addHandler(_TifffileWarningCapture())
+_INVALID_PAGE_OFFSET = re.compile(r"invalid page offset (\d+)")
 
 # Header-magic and TIFF-structure applicability comes from the slide format registry.
 
@@ -91,7 +126,10 @@ def check_zero_tail(
     window_len = min(sample_window_bytes, size)
     window = source.read_range(size - window_len, window_len)
     zero_run = len(window) - len(window.rstrip(b"\x00"))
-    threshold = max(min_zero_run_bytes, size * min_zero_run_fraction)
+    # The absolute floor exists to clear a normal encoder's edge-tile padding (up to ~a tile),
+    # but on a tiny file a 1 MiB floor is most of the file and a 30%-zeroed tail would slip
+    # through. Cap the floor at 10% of the file; irrelevant above ~10 MiB.
+    threshold = max(min(min_zero_run_bytes, size * 0.10), size * min_zero_run_fraction)
 
     if zero_run >= threshold:
         at_least = " (at least — the sampled window was entirely zero)" if zero_run == window_len < size else ""
@@ -124,11 +162,42 @@ def check_structural_completeness(source: ByteRangeSource, *, extension: str) ->
     exists for. The two checks are complementary, not redundant — neither
     supersedes the other.
 
+    It also catches a truncation that cuts the page-directory chain: tifffile
+    reports a chain pointer past EOF only as a logged warning (the pages read
+    so far still look fine), so that warning is captured and turned into an
+    error. Without it, a cut that keeps page 0 intact looks like a valid
+    single-page file.
+
     Named `tiff_page_count` rather than reusing `level_count` for its page
     count, since a TIFF's raw page count (thumbnail/label/macro images
     included) isn't the same thing OpenSlide's `level_count` reports later
     in the deep check — the two are related but shouldn't be conflated.
     """
+    with _TifffileWarningCapture.capture() as warnings:
+        issues, tech_metadata = _structural_completeness(source, extension=extension)
+
+    file_size = source.size()
+    for message in warnings:
+        match = _INVALID_PAGE_OFFSET.search(message)
+        if match:
+            offset = int(match.group(1))
+            where = (
+                f"byte {offset:,}, past the end of the {file_size:,}-byte file — the file is truncated"
+                if offset >= file_size
+                else f"an invalid location (byte {offset:,})"
+            )
+            issues.append(
+                IntegrityIssue(
+                    check="structural_completeness",
+                    severity="error",
+                    message=f"the TIFF page directory chain points to {where}; later pages are unreachable",
+                )
+            )
+            break
+    return issues, tech_metadata
+
+
+def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tuple[list[IntegrityIssue], dict]:
     if extension.lower() not in TIFF_BASED_EXTENSIONS:
         return [], {}
 
@@ -224,6 +293,13 @@ def run_fast_checks(source: ByteRangeSource, *, extension: str) -> tuple[list[In
     return issues, tech_metadata
 
 
+# OpenSlide open errors that mean "valid file, variant this library version doesn't
+# implement" rather than "damaged file". Matched as substrings of the error text.
+# Ventana scanners (e.g. DP 200) emit joint direction LEFT, which OpenSlide 4.0.x rejects
+# even for pristine files, so reporting it as corruption would be a false alarm.
+_OPENSLIDE_UNSUPPORTED_VARIANT_ERRORS = ("Bad direction attribute",)
+
+
 def run_deep_structural_check(local_path: Path) -> tuple[list[IntegrityIssue], dict]:
     """Opens the slide with OpenSlide, walks every pyramid level, and reads a
     handful of full-resolution tiles. Returns (issues, tech_metadata).
@@ -244,6 +320,18 @@ def run_deep_structural_check(local_path: Path) -> tuple[list[IntegrityIssue], d
     try:
         slide = openslide.OpenSlide(str(local_path))
     except openslide.OpenSlideError as exc:
+        if any(marker in str(exc) for marker in _OPENSLIDE_UNSUPPORTED_VARIANT_ERRORS):
+            issues.append(
+                IntegrityIssue(
+                    check="structural_open",
+                    severity="warning",
+                    message=(
+                        f"OpenSlide does not support this file variant ({exc}); deep validation could not run. "
+                        "The fast checks passed, so this is not evidence of corruption"
+                    ),
+                )
+            )
+            return issues, tech_metadata
         issues.append(
             IntegrityIssue(
                 check="structural_open",

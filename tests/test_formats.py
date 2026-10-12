@@ -79,6 +79,7 @@ def test_mrxs_missing_referenced_datafile_is_reported(tmp_path):
     data.mkdir()
     (data / "Slidedat.ini").write_text("[DATAFILE]\nFILE_COUNT = 2\nFILE_0 = Data0000.dat\nFILE_1 = Data0001.dat\n")
     (data / "Data0000.dat").write_bytes(b"d")
+    (data / "Index.dat").write_bytes(b"i")
     report = validate_slide(f, stability_wait_seconds=0)
     assert [i.check for i in report.issues] == ["bundle_completeness"]
     assert "Data0001.dat" in report.issues[0].message
@@ -92,6 +93,7 @@ def test_mrxs_complete_bundle_passes_bundle_check(tmp_path):
     data.mkdir()
     (data / "Slidedat.ini").write_text("[DATAFILE]\nFILE_COUNT = 1\nFILE_0 = Data0000.dat\n")
     (data / "Data0000.dat").write_bytes(b"d")
+    (data / "Index.dat").write_bytes(b"i")
     report = validate_slide(f, deep=False, stability_wait_seconds=0)
     assert "bundle_completeness" in report.checks_run
     assert not any(i.check == "bundle_completeness" for i in report.issues)
@@ -110,6 +112,7 @@ def test_vms_missing_referenced_image_is_reported(tmp_path):
 
 
 def _mrxs(tmp_path, ini: bytes | None, files=("Data0000.dat",), name="s"):
+    files = (*files, "Index.dat")
     f = tmp_path / f"{name}.mrxs"
     f.write_bytes(b"index")
     d = tmp_path / name
@@ -222,3 +225,9 @@ def test_tiny_files_never_raise(tmp_path, ext, size):
         (tmp_path / "t").mkdir()
     report = validate_slide(f, deep=True, stability_wait_seconds=0)
     assert not report.passed
+
+
+def test_mrxs_missing_index_dat_is_reported(tmp_path):
+    f = _mrxs(tmp_path, b"[DATAFILE]\nFILE_COUNT=1\nFILE_0=Data0000.dat\n")
+    (tmp_path / "s" / "Index.dat").unlink()
+    assert "Index.dat" in _bundle_errors(f)[0].message

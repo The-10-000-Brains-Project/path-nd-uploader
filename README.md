@@ -21,12 +21,12 @@ check is opt-in** (`--deep`) and needs the whole file on local disk.
 |---|---|---|
 | **TIFF header** | The file starts with a valid TIFF magic number (classic or BigTIFF, either byte order). TIFF-based formats (`.svs .ndpi .scn .bif .tif .tiff`); `.svslide` is checked for its SQLite header instead. | The file is under 4 bytes, or the first bytes aren't a TIFF magic number. |
 | **Zero-tail** | The end of the file isn't a long run of zero bytes. Reads the last 64 MiB and measures the actual trailing zero run. | The trailing zero run is larger than `max(1 MiB, 0.5% of file size)`, or the file is 0 bytes. This is the signature of an interrupted upload — including a file that was zero-padded back to its original length, which passes a size check but fails here. |
-| **Structural completeness** | Every TIFF page's tile/strip data fits inside the file's actual size. Parses the TIFF directory over range reads, never the whole file. TIFF-based formats only. | A page claims bytes past the end of the file (physically short / cut-off copy), the directory can't be parsed, there are no readable pages, or the first page is smaller than 512×512. |
+| **Structural completeness** | Every TIFF page's tile/strip data fits inside the file's actual size. Parses the TIFF directory over range reads, never the whole file. TIFF-based formats only. | A page claims bytes past the end of the file (physically short / cut-off copy), the page-directory chain points past the end of the file (a cut that leaves the first page intact), the directory can't be parsed, there are no readable pages, or the first page is smaller than 512×512. |
 
 Other supported formats (`.mrxs`, `.vms`, `.vmu`) get the zero-tail check
 only; the header and structural checks don't apply to them. Those multi-file
 formats also get a **bundle completeness** check on local files: `.mrxs`
-needs its sibling data directory, `Slidedat.ini`, and every `Data*.dat` it
+needs its sibling data directory, `Index.dat`, `Slidedat.ini`, and every `Data*.dat` it
 lists; `.vms`/`.vmu` need every image/optimisation file their index
 references.
 
@@ -40,6 +40,19 @@ Opens the slide with OpenSlide, walks every pyramid level, and reads a small
 region at the far corner of each level — the part that goes missing first if
 a write was cut off. Fails on an open error, zero pyramid levels,
 implausibly small dimensions, or any level that can't be read.
+
+**Known limits:**
+- MIRAX tile data (`Data*.dat`) is checked for presence only. A truncated or
+  zero-filled data file is not detected, since pristine MIRAX data files
+  legitimately end in long zero runs, so a zero-tail heuristic would
+  false-positive on good slides.
+- A zeroed or corrupted run in the *middle* of a file passes; only the tail,
+  the directory structure and the corner tile of each level are examined.
+- OpenSlide 4.0.x can't open some valid variants (e.g. Ventana scanners
+  that write joint direction `LEFT`). That is reported as a `warning`, not a
+  failure, since the fast checks already passed.
+- For `.mrxs`/`.vms`/`.vmu` in a bucket audit, sidecar files are looked up by
+  object name under the index object's prefix.
 
 **What it does not check:** image or diagnostic quality — focus, staining,
 artifacts, tissue coverage. That's a separate job (e.g. HistoQC). This tool

@@ -26,7 +26,7 @@ from google.cloud import storage
 
 from ..integrity import GCSBlobSource, IntegrityIssue, IntegrityReport, run_deep_structural_check, run_fast_checks
 from ..retry import is_transient, retry_transient
-from ..formats import SUPPORTED_EXTENSIONS
+from ..formats import SUPPORTED_EXTENSIONS, bundle_missing_parts, get_format
 
 # Scanning is latency-bound (many small range-reads per object), not bandwidth-bound like
 # uploads, so a much higher default concurrency than batch.py's uploads is safe and valuable —
@@ -40,11 +40,46 @@ def _iter_slide_blobs(bucket: storage.Bucket, prefix: str) -> Iterator[storage.B
             yield blob
 
 
+class GCSBundleFS:
+    """Bundle sibling lookups against a bucket prefix (see formats.BundleFS)."""
+
+    def __init__(self, bucket: storage.Bucket, directory: str) -> None:
+        self._bucket = bucket
+        self._dir = f"{directory}/" if directory else ""
+
+    def is_file(self, rel: str) -> bool:
+        return self._bucket.blob(self._dir + rel).exists()
+
+    def is_dir(self, rel: str) -> bool:
+        return any(True for _ in self._bucket.list_blobs(prefix=f"{self._dir}{rel}/", max_results=1))
+
+    def read_text(self, rel: str) -> str:
+        return self._bucket.blob(self._dir + rel).download_as_bytes().decode("utf-8-sig", errors="replace")
+
+
 def audit_object(blob: storage.Blob, *, deep: bool = False) -> IntegrityReport:
     source = GCSBlobSource(blob)
     extension = Path(blob.name).suffix
     issues, tech_metadata = run_fast_checks(source, extension=extension)
     checks_run = ["header_magic", "zero_tail", "structural_completeness"]
+
+    fmt = get_format(extension)
+    if fmt is not None and fmt.bundle:
+        # Sidecar files live under the same prefix as the index object; a
+        # truncated bundle (index uploaded, data dir missing/partial) is as
+        # unreadable as a truncated TIFF.
+        parent = str(Path(blob.name).parent)
+        directory = "" if parent == "." else parent
+        missing = bundle_missing_parts(Path(blob.name).name, GCSBundleFS(blob.bucket, directory))
+        checks_run.append("bundle_completeness")
+        if missing:
+            issues.append(
+                IntegrityIssue(
+                    check="bundle_completeness",
+                    severity="error",
+                    message=f"multi-file slide is missing: {', '.join(missing)}",
+                )
+            )
 
     if deep and not any(i.severity == "error" for i in issues):
         with tempfile.NamedTemporaryFile(suffix=extension) as tmp:
