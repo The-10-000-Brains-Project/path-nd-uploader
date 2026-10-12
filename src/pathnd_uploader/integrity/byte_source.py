@@ -55,7 +55,11 @@ class RangeReadFile:
     actually need, not the whole file.
     """
 
-    def __init__(self, source: ByteRangeSource) -> None:
+    def __init__(self, source: ByteRangeSource, *, name: str = "") -> None:
+        # `name` matters: tifffile picks its parsing mode from the file name's extension. In
+        # particular it only reads NDPI's 64-bit IFD offsets when the name ends in ".ndpi";
+        # without it, an NDPI with IFDs past 4 GiB fails to parse ("suspicious number of tags").
+        self.name = name
         self._source = source
         self._size = source.size()
         self._pos = 0

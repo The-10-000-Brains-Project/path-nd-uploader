@@ -201,6 +201,25 @@ def check_structural_completeness(source: ByteRangeSource, *, extension: str) ->
     return issues, tech_metadata
 
 
+def _open_tiff(source: ByteRangeSource, extension: str):
+    """Opens `source` with tifffile, naming it after the extension so tifffile picks
+    the right parsing mode (see RangeReadFile). A real .ndpi is NDPI-format, but a
+    standard TIFF that merely carries the .ndpi extension must not be called corrupt
+    for it, so fall back to a plain parse if the NDPI parse fails.
+    """
+    import tifffile
+
+    try:
+        tiff = tifffile.TiffFile(RangeReadFile(source, name=f"slide{extension}"))
+        if extension != ".ndpi" or len(tiff.pages) > 0:
+            return tiff
+        tiff.close()
+    except Exception as exc:
+        if extension != ".ndpi" or is_transient(exc):
+            raise
+    return tifffile.TiffFile(RangeReadFile(source, name="slide.tif"))
+
+
 def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tuple[list[IntegrityIssue], dict]:
     if extension.lower() not in TIFF_BASED_EXTENSIONS:
         return [], {}
@@ -210,7 +229,7 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
     file_size = source.size()
 
     try:
-        tiff = tifffile.TiffFile(RangeReadFile(source))
+        tiff = _open_tiff(source, extension.lower())
     except Exception as exc:  # tifffile raises a mix of its own and generic errors on malformed input
         if is_transient(exc):
             # Not a finding about the file — a network error while range-reading it.
@@ -229,58 +248,74 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
         )
 
     issues: list[IntegrityIssue] = []
-    tech_metadata: dict = {"tiff_page_count": len(tiff.pages)}
+    tech_metadata: dict = {}
 
-    if len(tiff.pages) == 0:
-        # tifffile is lenient: garbage after a valid magic number doesn't
-        # always raise, it can just log a warning and yield zero pages —
-        # that's just as unusable as a parse error and must be reported.
+    # tifffile loads pages lazily, so a truncated or corrupt directory can raise (struct.error,
+    # TiffFileError, ...) anywhere below, not just in the constructor above.
+    try:
+        tech_metadata["tiff_page_count"] = len(tiff.pages)
+
+        if len(tiff.pages) == 0:
+            # tifffile is lenient: garbage after a valid magic number doesn't
+            # always raise, it can just log a warning and yield zero pages —
+            # that's just as unusable as a parse error and must be reported.
+            issues.append(
+                IntegrityIssue(
+                    check="structural_completeness",
+                    severity="error",
+                    message="no readable TIFF pages found — the file's directory structure appears to be corrupted",
+                )
+            )
+            return issues, tech_metadata
+
+        with tiff:
+            for i, page in enumerate(tiff.pages):
+                if page.is_tiled:
+                    offsets = page.tags.get("TileOffsets")
+                    bytecounts = page.tags.get("TileByteCounts")
+                else:
+                    offsets = page.tags.get("StripOffsets")
+                    bytecounts = page.tags.get("StripByteCounts")
+
+                if offsets is not None and bytecounts is not None:
+                    claimed_end = max((o + c for o, c in zip(offsets.value, bytecounts.value)), default=0)
+                    if claimed_end > file_size:
+                        issues.append(
+                            IntegrityIssue(
+                                check="structural_completeness",
+                                severity="error",
+                                message=(
+                                    f"page {i}'s data claims to need up to byte {claimed_end:,}, but the "
+                                    f"file is only {file_size:,} bytes — the file is truncated"
+                                ),
+                            )
+                        )
+
+                if i == 0 and len(page.shape) >= 2:
+                    height, width = page.shape[0], page.shape[1]
+                    tech_metadata["dimensions"] = (width, height)
+                    if width < 512 or height < 512:
+                        issues.append(
+                            IntegrityIssue(
+                                check="dimensions",
+                                severity="error",
+                                message=f"slide dimensions {(width, height)} are implausibly small for a whole-slide image",
+                            )
+                        )
+
+    except Exception as exc:
+        if is_transient(exc):
+            raise
         issues.append(
             IntegrityIssue(
                 check="structural_completeness",
                 severity="error",
-                message="no readable TIFF pages found — the file's directory structure appears to be corrupted",
+                message=f"could not read the TIFF page structure (file is likely truncated or corrupted): {exc}",
             )
         )
-        return issues, tech_metadata
-
-    with tiff:
-        for i, page in enumerate(tiff.pages):
-            if page.is_tiled:
-                offsets = page.tags.get("TileOffsets")
-                bytecounts = page.tags.get("TileByteCounts")
-            else:
-                offsets = page.tags.get("StripOffsets")
-                bytecounts = page.tags.get("StripByteCounts")
-
-            if offsets is not None and bytecounts is not None:
-                claimed_end = max((o + c for o, c in zip(offsets.value, bytecounts.value)), default=0)
-                if claimed_end > file_size:
-                    issues.append(
-                        IntegrityIssue(
-                            check="structural_completeness",
-                            severity="error",
-                            message=(
-                                f"page {i}'s data claims to need up to byte {claimed_end:,}, but the "
-                                f"file is only {file_size:,} bytes — the file is truncated"
-                            ),
-                        )
-                    )
-
-            if i == 0 and len(page.shape) >= 2:
-                height, width = page.shape[0], page.shape[1]
-                tech_metadata["dimensions"] = (width, height)
-                if width < 512 or height < 512:
-                    issues.append(
-                        IntegrityIssue(
-                            check="dimensions",
-                            severity="error",
-                            message=f"slide dimensions {(width, height)} are implausibly small for a whole-slide image",
-                        )
-                    )
-
+        with contextlib.suppress(Exception):
+            tiff.close()
     return issues, tech_metadata
-
 
 def run_fast_checks(source: ByteRangeSource, *, extension: str) -> tuple[list[IntegrityIssue], dict]:
     issues = []

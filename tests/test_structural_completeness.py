@@ -122,3 +122,67 @@ def test_truncation_that_cuts_only_the_page_chain_is_caught(tmp_path):
     issues, _ = check_structural_completeness(LocalFileSource(cut), extension=".svs")
     assert any("page directory chain" in i.message and "truncated" in i.message for i in issues), issues
     assert check_structural_completeness(LocalFileSource(full), extension=".svs")[0] == []
+
+
+def test_range_read_file_carries_extension_so_tifffile_uses_ndpi_64bit_offsets(clean_slide_path):
+    # Regression (found on a real 6.9 GB NDPI): tifffile reads NDPI's 64-bit IFD offsets only
+    # when the file name ends in .ndpi. Our wrapper had no name, so NDPIs with IFDs past
+    # 4 GiB failed with "suspicious number of tags".
+    import tifffile
+
+    from pathnd_uploader.integrity.byte_source import RangeReadFile
+
+    source = LocalFileSource(clean_slide_path)
+    with tifffile.TiffFile(RangeReadFile(source, name="slide.ndpi")) as t:
+        assert t.tiff == tifffile.TIFF.NDPI_LE
+    with tifffile.TiffFile(RangeReadFile(source, name="slide.svs")) as t:
+        assert t.tiff == tifffile.TIFF.CLASSIC_LE
+
+
+def test_check_structural_completeness_passes_extension_through_to_tifffile(clean_slide_path):
+    from unittest.mock import patch
+
+    import tifffile
+
+    seen = []
+    real = tifffile.TiffFile
+
+    def spy(fh, *a, **kw):
+        seen.append(getattr(fh, "name", None))
+        return real(fh, *a, **kw)
+
+    with patch("tifffile.TiffFile", spy):
+        check_structural_completeness(LocalFileSource(clean_slide_path), extension=".NDPI")
+    assert seen[0] == "slide.ndpi"  # NDPI parse first; a plain TIFF then falls back to "slide.tif"
+
+
+def test_file_cut_mid_ifd_is_reported_not_raised(clean_slide_path, tmp_path):
+    # Regression (found on a real 6.9 GB NDPI truncated by 1 byte): tifffile loads pages lazily,
+    # so a cut inside an IFD raised struct.error during iteration, past the constructor's
+    # try/except, and escaped as an uncaught crash.
+    import tifffile
+
+    with tifffile.TiffFile(clean_slide_path) as t:
+        ifd_offset = t.pages[-1].offset
+    data = clean_slide_path.read_bytes()
+    for cut in (ifd_offset + 2, ifd_offset + 7, ifd_offset + 20, len(data) - 1):
+        f = tmp_path / f"cut{cut}.svs"
+        f.write_bytes(data[:cut])
+        issues, _ = check_structural_completeness(LocalFileSource(f), extension=".svs")
+        assert any(i.check == "structural_completeness" and i.severity == "error" for i in issues), cut
+
+
+def test_lazy_page_errors_that_are_transient_still_propagate(clean_slide_path):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import requests
+
+    class Boom:
+        def __len__(self):
+            raise requests.exceptions.ConnectionError("reset")
+
+    fake = SimpleNamespace(pages=Boom(), close=lambda: None)
+    with patch("tifffile.TiffFile", return_value=fake):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            check_structural_completeness(LocalFileSource(clean_slide_path), extension=".svs")
