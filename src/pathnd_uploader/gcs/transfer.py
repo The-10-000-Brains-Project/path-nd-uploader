@@ -24,6 +24,7 @@ from typing import Callable
 
 from google.cloud import storage
 
+from ..formats import _safe_rel, get_format, vms_references
 from ..integrity import IntegrityIssue, IntegrityReport
 from ..retry import is_transient, retry_transient
 from .audit import _audit_object_with_retry, _iter_slide_blobs
@@ -75,6 +76,38 @@ class TransferSummary:
     @property
     def inconclusive(self) -> list[TransferResult]:
         return [r for r in self.results if r.is_inconclusive]
+
+
+def _rewrite(source_blob: storage.Blob, dest_blob: storage.Blob) -> None:
+    token = None
+    while True:
+        token, _bytes_written, _total_bytes = dest_blob.rewrite(source_blob, token=token)
+        if token is None:
+            return
+
+
+def _bundle_sidecar_blobs(source_blob: storage.Blob) -> list[tuple[storage.Blob, str]]:
+    """(sidecar blob, path relative to the index object's directory) for a multi-file slide,
+    or [] for single-file formats. A MIRAX index without its data directory is not a slide.
+    """
+    fmt = get_format(source_blob.name[source_blob.name.rfind(".") :]) if "." in source_blob.name else None
+    if fmt is None or not fmt.bundle:
+        return []
+    directory, _, name = source_blob.name.rpartition("/")
+    prefix = f"{directory}/" if directory else ""
+    stem, _, ext = name.rpartition(".")
+    if ext.lower() == "mrxs":
+        return [(b, b.name[len(prefix) :]) for b in source_blob.bucket.list_blobs(prefix=f"{prefix}{stem}/") if not b.name.endswith("/")]
+    try:
+        refs = vms_references(source_blob.download_as_bytes().decode("utf-8-sig", errors="replace"))
+    except Exception:  # noqa: BLE001 - an unreadable index was already rejected by the bundle check
+        return []
+    out = []
+    for ref in refs:
+        rel = ref.replace("\\", "/")
+        if _safe_rel(ref):
+            out.append((source_blob.bucket.blob(prefix + rel), rel))
+    return out
 
 
 def _remap_key(key: str, *, prefix: str, dest_prefix: str | None) -> str:
@@ -131,12 +164,25 @@ def transfer_object(
     else:
         report = empty_report
 
+    # Multi-file slides: sidecars first, index last. The index is what the idempotency check
+    # and every reader treat as "this slide exists", so an interrupted run must not leave one
+    # behind without its data.
+    dest_dir = key.rpartition("/")[0]
+    dest_dir = f"{dest_dir}/" if dest_dir else ""
+    src_stem = source_blob.name.rpartition("/")[2].rpartition(".")[0]
+    dest_stem = key.rpartition("/")[2].rpartition(".")[0]
+    for sidecar, rel in _bundle_sidecar_blobs(source_blob):
+        if source_blob.name.lower().endswith(".mrxs") and src_stem != dest_stem:
+            # MIRAX finds its data directory by the index file's name, so it must follow a rename.
+            rel = dest_stem + rel[len(src_stem) :]
+        side_key = dest_dir + rel
+        existing_side = dest_bucket.get_blob(side_key)
+        if existing_side is not None and existing_side.crc32c is not None and existing_side.crc32c == sidecar.crc32c:
+            continue
+        _rewrite(sidecar, dest_bucket.blob(side_key))
+
     dest_blob = dest_bucket.blob(key)
-    token = None
-    while True:
-        token, _bytes_written, _total_bytes = dest_blob.rewrite(source_blob, token=token)
-        if token is None:
-            break
+    _rewrite(source_blob, dest_blob)
 
     dest_blob.metadata = {
         **(dest_blob.metadata or {}),

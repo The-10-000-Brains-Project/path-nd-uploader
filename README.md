@@ -212,8 +212,12 @@ with "recognized but not yet supported" instead of being half-checked.
   scan protect those files.
 - **Bucket audits of multi-file slides** look for the other files by name,
   under the same prefix as the `.mrxs`/`.vms`/`.vmu` object.
-- **Bucket access is tested with mocks only.** The `audit` and `transfer`
-  code has not been run against a real bucket.
+- **Bucket access** has been run once against a real bucket (a 9-object test
+  set, about 5 GB, in europe-west4). It has not been run at scale, across
+  regions, or against buckets with thousands of objects.
+- **`transfer` copies multi-file slides whole.** For `.mrxs` it copies the data
+  folder, and for `.vms`/`.vmu` the files the index lists, then the index last.
+  Other files in the same folder are left alone.
 
 What this tool does not check: focus, stain, artifacts, tissue coverage, or
 any other image quality question. For that, use something like HistoQC. This

@@ -308,3 +308,70 @@ def test_transfer_bucket_counts_already_present_separately():
     assert len(summary.already_present) == 1
     assert len(summary.skipped) == 0
     mock_audit.assert_not_called()
+
+
+class _FakeBlob:
+    def __init__(self, bucket, name, data=b"x"):
+        self.bucket, self.name, self.data, self.size = bucket, name, data, len(data)
+        self.crc32c = None
+        self.metadata = None
+
+    def rewrite(self, source, token=None):
+        self.bucket.objects[self.name] = source.data
+        return None, 0, 0
+
+    def patch(self):
+        pass
+
+    def download_as_bytes(self, *a, **k):
+        return self.data
+
+
+class _FakeBucket:
+    def __init__(self, name, objects):
+        self.name, self.objects = name, objects
+        self.order = []
+
+    def blob(self, name):
+        b = _FakeBlob(self, name, self.objects.get(name, b""))
+        orig = b.rewrite
+
+        def rewrite(source, token=None):
+            self.order.append(name)
+            return orig(source, token)
+
+        b.rewrite = rewrite
+        return b
+
+    def get_blob(self, name):
+        return self.blob(name) if name in self.objects else None
+
+    def list_blobs(self, prefix="", max_results=None):
+        return [_FakeBlob(self, n, d) for n, d in sorted(self.objects.items()) if n.startswith(prefix)]
+
+
+def test_transfer_copies_mirax_data_directory_with_index_last():
+    # Regression (found on a real bucket): only the .mrxs index was copied, leaving an
+    # unusable slide at the destination. Sidecars go first so an interrupted run never leaves
+    # an index that looks complete.
+    src = _FakeBucket("src", {"a/s.mrxs": b"idx", "a/s/Slidedat.ini": b"i", "a/s/Data0000.dat": b"d", "a/other.txt": b"o"})
+    dst = _FakeBucket("dst", {})
+    result = transfer_object(src.blob("a/s.mrxs"), dst, validate=False)
+    assert result.copied
+    assert set(dst.objects) == {"a/s.mrxs", "a/s/Slidedat.ini", "a/s/Data0000.dat"}
+    assert dst.order[-1] == "a/s.mrxs"
+
+
+def test_transfer_follows_mirax_index_rename_with_its_data_directory():
+    src = _FakeBucket("src", {"a/s.mrxs": b"idx", "a/s/Slidedat.ini": b"i"})
+    dst = _FakeBucket("dst", {})
+    transfer_object(src.blob("a/s.mrxs"), dst, dest_key="b/t.mrxs", validate=False)
+    assert set(dst.objects) == {"b/t.mrxs", "b/t/Slidedat.ini"}
+
+
+def test_transfer_copies_vms_referenced_files_only():
+    index = b"[Virtual Microscope Specimen]\nImageFile(0,0)=a.jpg\nMapFile=m.jpg\n"
+    src = _FakeBucket("src", {"s.vms": index, "a.jpg": b"j", "m.jpg": b"m", "unrelated.jpg": b"u"})
+    dst = _FakeBucket("dst", {})
+    transfer_object(src.blob("s.vms"), dst, validate=False)
+    assert set(dst.objects) == {"s.vms", "a.jpg", "m.jpg"}
