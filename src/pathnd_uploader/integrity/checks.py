@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -204,6 +205,18 @@ def check_structural_completeness(source: ByteRangeSource, *, extension: str) ->
 TILE_WINDOW_BYTES = 4096
 MAX_TILE_SAMPLES_PER_PAGE = 24
 MAX_TILE_SAMPLES_TOTAL = 64
+TILE_SAMPLES_ENV = "PATHND_TILE_SAMPLES"
+
+
+def _tile_sample_budget() -> tuple[int, int]:
+    """(total, per-page cap) of tile windows to sample; PATHND_TILE_SAMPLES overrides the default total."""
+    raw = os.environ.get(TILE_SAMPLES_ENV, "").strip()
+    try:
+        total = int(raw) if raw else MAX_TILE_SAMPLES_TOTAL
+    except ValueError:
+        total = MAX_TILE_SAMPLES_TOTAL
+    total = max(1, min(total, 100_000))
+    return total, max(MAX_TILE_SAMPLES_PER_PAGE, total)
 _MIN_JUDGEABLE_TILE_BYTES = 64
 
 
@@ -229,7 +242,7 @@ def _zero_filled_tile_windows(source: ByteRangeSource, page, offsets, bytecounts
         return 0, 0
     offs, counts = list(offsets), list(bytecounts)
     read = zero = 0
-    cap = min(MAX_TILE_SAMPLES_PER_PAGE, budget)
+    cap = budget
     for idx in _sample_indices(len(offs), cap):
         off, count = int(offs[idx]), int(counts[idx])
         if count < _MIN_JUDGEABLE_TILE_BYTES or off + count > source.size():
@@ -365,10 +378,11 @@ def _structural_completeness(source: ByteRangeSource, *, extension: str) -> tupl
         # page holds nearly all the bytes, so it should get nearly all the windows), with at
         # least one window per page so thumbnails/labels are still looked at.
         total_bytes = sum(sp[4] for sp in sampled_pages) or 1
+        sample_total, sample_page_cap = _tile_sample_budget()
         for i, page, offsets, bytecounts, nbytes in sampled_pages:
-            share = max(1, round(MAX_TILE_SAMPLES_TOTAL * nbytes / total_bytes))
+            share = max(1, round(sample_total * nbytes / total_bytes))
             read, zero = _zero_filled_tile_windows(
-                source, page, offsets, bytecounts, min(share, MAX_TILE_SAMPLES_PER_PAGE)
+                source, page, offsets, bytecounts, min(share, sample_page_cap)
             )
             windows_read += read
             windows_zero += zero

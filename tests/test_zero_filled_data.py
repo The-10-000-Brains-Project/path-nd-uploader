@@ -98,3 +98,16 @@ def test_tiny_tiles_are_not_judged(tmp_path):
     tifffile.imwrite(f, img, tile=(256, 256), photometric="rgb", compression="zlib")
     assert check_structural_completeness(LocalFileSource(f), extension=".svs")[0] == []
     assert scan_zero_filled_data(f, ".svs")[0] == []
+
+
+def test_tile_sample_count_is_configurable_via_env(monkeypatch):
+    from pathnd_uploader.integrity.checks import MAX_TILE_SAMPLES_TOTAL, _tile_sample_budget
+
+    monkeypatch.delenv("PATHND_TILE_SAMPLES", raising=False)
+    assert _tile_sample_budget()[0] == MAX_TILE_SAMPLES_TOTAL
+    monkeypatch.setenv("PATHND_TILE_SAMPLES", "500")
+    assert _tile_sample_budget() == (500, 500)
+    monkeypatch.setenv("PATHND_TILE_SAMPLES", "junk")
+    assert _tile_sample_budget()[0] == MAX_TILE_SAMPLES_TOTAL
+    monkeypatch.setenv("PATHND_TILE_SAMPLES", "0")
+    assert _tile_sample_budget()[0] == 1

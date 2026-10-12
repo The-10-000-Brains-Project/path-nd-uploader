@@ -142,7 +142,14 @@ path-nd-uploader audit my-bucket --deep            # downloads each object that 
 5. **Multi-file slides** (`.mrxs`, `.vms`, `.vmu`). Every file the slide refers
    to exists.
 
-Fast checks add roughly 150 small range reads per file.
+Fast checks add roughly 150 small range reads per file. To sample more
+windows (more reads, better odds of hitting a zeroed run), set
+`PATHND_TILE_SAMPLES`. On a 2 GB NDPI with an 8 MiB zeroed run at 5 different
+positions, the default of 64 caught 1 of 5 and 512 caught all 5:
+
+```bash
+PATHND_TILE_SAMPLES=512 path-nd-uploader audit my-bucket
+```
 
 ### What deep checks add
 
